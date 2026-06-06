@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 
@@ -31,6 +32,10 @@ def _frame(history: list[dict[str, Any]], seconds: int) -> dict[str, Any]:
             "volumeRatioAvg": 0.0,
             "volumeTrend": "unknown",
             "breakoutState": "NO_DATA",
+            "coveragePct": 0.0,
+            "maxGapSeconds": 0.0,
+            "staleSeconds": 0.0,
+            "quality": "NO_DATA",
         }
     end_ts = float(history[-1].get("timestamp", 0) or 0)
     start_ts = end_ts - seconds
@@ -46,7 +51,19 @@ def _frame(history: list[dict[str, Any]], seconds: int) -> dict[str, Any]:
             "volumeRatioAvg": 0.0,
             "volumeTrend": "unknown",
             "breakoutState": "NO_DATA",
+            "coveragePct": 0.0,
+            "maxGapSeconds": 0.0,
+            "staleSeconds": round(max(0.0, time.time() - end_ts), 3),
+            "quality": "INSUFFICIENT",
         }
+    timestamps = sorted(float(x.get("timestamp", 0) or 0) for x in frame)
+    observed_seconds = max(0.0, timestamps[-1] - timestamps[0])
+    coverage_pct = min(1.0, observed_seconds / seconds)
+    max_gap_seconds = max(
+        (right - left for left, right in zip(timestamps, timestamps[1:])),
+        default=0.0,
+    )
+    stale_seconds = max(0.0, time.time() - timestamps[-1])
     open_price = prices[0]
     close_price = prices[-1]
     high = max(prices)
@@ -70,6 +87,13 @@ def _frame(history: list[dict[str, Any]], seconds: int) -> dict[str, Any]:
         breakout_state = "BREAKOUT_UP" if change_pct > 0 else "BREAKOUT_DOWN"
     elif abs(change_pct) >= 0.25 and (late_vol < 1.15 or wick_ratio > 2.5):
         breakout_state = "FAKEOUT"
+    quality = "GOOD"
+    if stale_seconds > 15:
+        quality = "STALE"
+    elif max_gap_seconds > 20:
+        quality = "GAPPED"
+    elif coverage_pct < 0.8:
+        quality = "PARTIAL"
     return {
         "samples": len(prices),
         "changePct": round(change_pct, 4),
@@ -79,6 +103,10 @@ def _frame(history: list[dict[str, Any]], seconds: int) -> dict[str, Any]:
         "volumeRatioAvg": round(sum(volumes) / len(volumes), 4),
         "volumeTrend": volume_trend,
         "breakoutState": breakout_state,
+        "coveragePct": round(coverage_pct, 4),
+        "maxGapSeconds": round(max_gap_seconds, 3),
+        "staleSeconds": round(stale_seconds, 3),
+        "quality": quality,
     }
 
 

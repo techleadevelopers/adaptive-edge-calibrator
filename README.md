@@ -1,4 +1,4 @@
-# Quant Brain
+# intelligence Capture Edge - AI
 
 Quant Brain is a standalone Python intelligence engine designed for edge intelligence, mathematical strategy validation, and positive Realized PnL optimization.
 

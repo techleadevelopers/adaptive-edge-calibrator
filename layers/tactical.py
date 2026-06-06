@@ -30,8 +30,8 @@ class TacticalAlert:
     timestamp: float = field(default_factory=time.time)
 
 
-# Buffer de snapshots por símbolo para análise temporal
-_snap_buffer: dict[str, deque] = defaultdict(lambda: deque(maxlen=120))
+# Keep at least 30 minutes at the default 5-second collection interval.
+_snap_buffer: dict[str, deque] = defaultdict(lambda: deque(maxlen=360))
 _active_alerts: list[TacticalAlert] = []
 _alert_callbacks: list = []
 
@@ -96,6 +96,10 @@ async def _process_snapshot(snap: MarketSnapshot):
     sym = snap.symbol
     _snap_buffer[sym].append({
         "price": snap.price,
+        "bid": snap.bid,
+        "ask": snap.ask,
+        "spread_bps": snap.spread_bps,
+        "atr_pct": snap.atr_pct,
         "price_change_pct": snap.price_change_pct,
         "oi_change_pct": snap.oi_change_pct,
         "funding_rate": snap.funding_rate,

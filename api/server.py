@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from core.feature_engine import FeatureEngine, SYMBOLS
 from core import knowledge_base as kb
 from core.recommendation import recommend_entry, simulate_gate_rejections
+from core.edge_gate import evaluate_edge_gate
 from core.movement_sniper import evaluate_sniper_window, build_movement_features, classify_btc_commander
 from layers.tactical import run_tactical_loop, get_active_alerts, get_snapshot_history, TacticalAlert
 from layers.strategic import build_strategic_report, report_to_dict, compute_edge_evolution
@@ -370,6 +371,14 @@ async def recommend_entry_endpoint(body: dict, days: int = Query(30, ge=1, le=36
     return await recommend_entry(body, days=days)
 
 
+@app.post("/edge/evaluate")
+async def evaluate_edge_endpoint(body: dict):
+    """Authoritative edge gate: backend sends pending entry context, Quant Brain returns allow/reject."""
+    if "symbol" not in body:
+        raise HTTPException(400, "Required field: symbol")
+    return await evaluate_edge_gate(body)
+
+
 @app.get("/simulate/gate-rejections")
 async def simulate_gate_rejections_endpoint(
     days: int = Query(30, ge=1, le=365),
@@ -406,5 +415,6 @@ async def root():
             "strategic": ["/strategic/report", "/strategic/analyze", "/strategic/hypotheses"],
             "knowledge_base": ["/kb/patterns", "/kb/observations", "/kb/insights", "/kb/stats", "/kb/trades"],
             "recommendation": ["/recommend/entry", "/simulate/gate-rejections"],
+            "edge_gate": ["/edge/evaluate"],
         }
     }

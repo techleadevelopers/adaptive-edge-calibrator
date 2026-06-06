@@ -11,7 +11,25 @@ from core.signal_learning import (
     record_signal_from_gate,
     score_signal_context,
 )
+from core.shadow_model import predict_shadow
 from layers.tactical import get_snapshot_history
+
+
+def _target_moves(config: dict[str, Any], spread_bps: float) -> dict[str, float]:
+    margin = max(_num(config.get("marginPerTrade"), 1.0), 0.01)
+    leverage = max(_num(config.get("leverage"), 1.0), 1.0)
+    notional = margin * leverage
+    fees_bps = (
+        _num(config.get("entryFeeBps", config.get("takerFeeBps")), 5.0)
+        + _num(config.get("exitFeeBps", config.get("takerFeeBps")), 5.0)
+        + 2 * _num(config.get("slippageBpsPerSide"), 2.0)
+        + max(0.0, spread_bps)
+    )
+    costs_pct = fees_bps / 100 + max(0.0, _num(config.get("estimatedFundingCostPct"), 0.0))
+    return {
+        str(target): target / notional * 100 + costs_pct
+        for target in (0.5, 1.0, 2.0)
+    }
 
 
 def _num(value: Any, fallback: float = 0.0) -> float:
@@ -105,15 +123,52 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     if current_pf is not None and pf_min > 0 and _num(current_pf) < pf_min:
         gate_rejects.append(f"PF_REJECT: PF {_num(current_pf):.2f}x < min {pf_min:.2f}x")
 
+    alt_history = get_snapshot_history(symbol, 900)
+    btc_history = get_snapshot_history("BTC-USDT", 900)
+    spread_bps = _num(alt_history[-1].get("spread_bps"), 0.0) if alt_history else 0.0
+    target_moves_pct = _target_moves(config, spread_bps)
     sniper = evaluate_sniper_window(
         symbol,
-        get_snapshot_history(symbol, 300),
-        get_snapshot_history("BTC-USDT", 300),
+        alt_history,
+        btc_history,
+        target_moves_pct=target_moves_pct,
     )
     await finalize_due_signal_outcomes()
     signal_memory = await record_signal_from_gate(symbol, position_side, sniper, config)
     signal_edge = await score_signal_context(symbol, signal_memory["side"], signal_memory["contextKey"])
     news_context = await kb.get_active_news_context(symbol)
+    operational_risk = await kb.get_operational_risk_metrics(hours=24)
+    data_quality = {
+        "alt1m": sniper["altTimeframes"]["1m"],
+        "alt5m": sniper["altTimeframes"]["5m"],
+        "alt15m": sniper["altTimeframes"]["15m"],
+        "btc1m": sniper["btcTimeframes"]["1m"],
+        "btc5m": sniper["btcTimeframes"]["5m"],
+        "btc15m": sniper["btcTimeframes"]["15m"],
+    }
+    if any(frame["quality"] == "STALE" for frame in data_quality.values()):
+        gate_rejects.append("DATA_STALE_REJECT: market snapshots are stale")
+    if any(frame["quality"] == "GAPPED" for frame in data_quality.values()):
+        gate_rejects.append("DATA_GAP_REJECT: snapshot continuity is degraded")
+    if _bool(config.get("requireFull15mContext"), True):
+        if (
+            data_quality["alt15m"]["coveragePct"] < 0.8
+            or data_quality["btc15m"]["coveragePct"] < 0.8
+        ):
+            gate_rejects.append("DATA_15M_REJECT: insufficient 15-minute context")
+
+    max_daily_loss_pct = _num(config.get("maxDailyLossPct"), 0.0)
+    max_drawdown_pct = _num(config.get("maxDrawdownPct"), 0.0)
+    max_consecutive_losses = int(_num(config.get("maxConsecutiveLosses"), 0))
+    if max_daily_loss_pct > 0 and operational_risk["netPnlPct"] <= -max_daily_loss_pct:
+        gate_rejects.append("DAILY_LOSS_KILL_SWITCH: daily loss limit reached")
+    if max_drawdown_pct > 0 and operational_risk["maxDrawdownPct"] >= max_drawdown_pct:
+        gate_rejects.append("DRAWDOWN_KILL_SWITCH: drawdown limit reached")
+    if (
+        max_consecutive_losses > 0
+        and operational_risk["consecutiveLosses"] >= max_consecutive_losses
+    ):
+        gate_rejects.append("LOSS_STREAK_KILL_SWITCH: consecutive loss limit reached")
 
     if sniper["decision"].startswith("BLOCK_"):
         gate_rejects.append(f"SNIPER_{sniper['decision']}: {','.join(sniper['reasons'])}")
@@ -125,6 +180,44 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "SIGNAL_EDGE_REJECT: target-hit context degraded "
             f"(score {signal_edge['score']:.4f})"
         )
+
+    margin = max(_num(config.get("marginPerTrade"), 1.0), 0.01)
+    leverage = max(_num(config.get("leverage"), 1.0), 1.0)
+    cost_pct = float(signal_memory.get("estimatedCostPct", 0.0))
+    target_050_pct = float(signal_memory["targetMovesPct"].get("0.5", 0.0))
+    gross_target_pct = max(0.0, target_050_pct - cost_pct)
+    min_edge_over_cost_pct = _num(config.get("minEdgeOverCostPct"), 0.03)
+    if gross_target_pct <= cost_pct + min_edge_over_cost_pct:
+        gate_rejects.append(
+            "COST_EDGE_REJECT: target movement does not clear execution costs and noise"
+        )
+    effective_stats = (
+        signal_edge["context"]
+        if signal_edge["context"]["samples"] >= signal_edge["minSamples"]
+        else signal_edge["symbolSide"]
+    )
+    hit_probability = float(effective_stats.get("hit_050", 0.0))
+    stop_move_pct = max(
+        _num(config.get("stopMovePct"), target_moves_pct["1.0"]),
+        0.15,
+    )
+    notional = margin * leverage
+    loss_usdt = stop_move_pct / 100 * notional
+    net_ev_usdt = hit_probability * 0.5 - (1 - hit_probability) * loss_usdt
+    if effective_stats.get("samples", 0) >= signal_edge["minSamples"] and net_ev_usdt <= 0:
+        gate_rejects.append(f"NET_EV_REJECT: expected value {net_ev_usdt:.4f} USDT")
+    shadow_ml = predict_shadow({
+        "symbol": symbol,
+        "side": signal_memory["side"],
+        "context_key": signal_memory["contextKey"],
+        "target_050_move_pct": target_moves_pct["0.5"],
+        "estimated_cost_pct": cost_pct,
+        "features": {
+            "alt": sniper["altFeatures"],
+            "btc": sniper["btcFeatures"],
+            "alt_timeframes": sniper["altTimeframes"],
+        },
+    })
 
     if news_context["action"] == "block":
         gate_rejects.append("NEWS_RISK_REJECT: active high-impact event blocks entries")
@@ -169,7 +262,17 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "sniper": sniper,
         "signalMemory": signal_memory,
         "signalEdge": signal_edge,
+        "economics": {
+            "targetMovesPct": target_moves_pct,
+            "estimatedCostPct": round(cost_pct, 6),
+            "hitProbability": round(hit_probability, 4),
+            "estimatedLossUsdt": round(loss_usdt, 4),
+            "netEvUsdt": round(net_ev_usdt, 4),
+        },
         "newsContext": news_context,
+        "dataQuality": data_quality,
+        "operationalRisk": operational_risk,
+        "shadowMl": shadow_ml,
         "realizedEdge": recommendation,
         "mode": "movement_first_realized_pnl_auditor",
     }

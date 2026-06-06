@@ -17,6 +17,9 @@ class MovementFeatures:
     window_seconds: int
     first_price: float
     last_price: float
+    bid: float
+    ask: float
+    spread_bps: float
     high_price: float
     low_price: float
     price_change_pct: float
@@ -79,6 +82,12 @@ def _movement_state(
 
 
 def build_movement_features(symbol: str, history: list[dict], window_seconds: int = SNIPER_WINDOW_SECONDS) -> MovementFeatures:
+    if history:
+        end_ts = float(history[-1].get("timestamp", 0) or 0)
+        history = [
+            item for item in history
+            if float(item.get("timestamp", 0) or 0) >= end_ts - window_seconds
+        ]
     if not history:
         return MovementFeatures(
             symbol=symbol,
@@ -86,6 +95,9 @@ def build_movement_features(symbol: str, history: list[dict], window_seconds: in
             window_seconds=window_seconds,
             first_price=0.0,
             last_price=0.0,
+            bid=0.0,
+            ask=0.0,
+            spread_bps=0.0,
             high_price=0.0,
             low_price=0.0,
             price_change_pct=0.0,
@@ -106,6 +118,9 @@ def build_movement_features(symbol: str, history: list[dict], window_seconds: in
     valid_prices = [p for p in prices if p > 0]
     first_price = valid_prices[0] if valid_prices else 0.0
     last_price = valid_prices[-1] if valid_prices else 0.0
+    bid = _last_float(history, "bid", last_price)
+    ask = _last_float(history, "ask", last_price)
+    spread_bps = _last_float(history, "spread_bps")
     high_price = max(valid_prices) if valid_prices else 0.0
     low_price = min(valid_prices) if valid_prices else 0.0
     change_pct = _pct_change(prices[0], prices[-1]) if len(prices) >= 2 else 0.0
@@ -129,6 +144,9 @@ def build_movement_features(symbol: str, history: list[dict], window_seconds: in
         window_seconds=window_seconds,
         first_price=round(first_price, 8),
         last_price=round(last_price, 8),
+        bid=round(bid, 8),
+        ask=round(ask, 8),
+        spread_bps=round(spread_bps, 4),
         high_price=round(high_price, 8),
         low_price=round(low_price, 8),
         price_change_pct=round(change_pct, 4),
@@ -160,7 +178,11 @@ def classify_btc_commander(btc: MovementFeatures) -> dict[str, Any]:
     return {"state": btc.movement_state, "confidence": 0.5}
 
 
-def _target_probability(alt: MovementFeatures, btc: MovementFeatures, target_usdt: float) -> float:
+def _target_probability(
+    alt: MovementFeatures,
+    btc: MovementFeatures,
+    target_move_pct: float,
+) -> float:
     if alt.samples < 3 or btc.samples < 3:
         return 0.0
     direction_ok = (
@@ -179,10 +201,10 @@ def _target_probability(alt: MovementFeatures, btc: MovementFeatures, target_usd
         base -= 0.16
     if alt.movement_state in {"CHOP", "FAKE_MOVE", "BTC_CONFLICT", "NO_DATA"}:
         base -= 0.22
-    if target_usdt >= 2:
-        base -= 0.10
-    elif target_usdt >= 1:
-        base -= 0.04
+    available_move = max(abs(alt.price_change_pct), alt.atr_pct * 0.25)
+    if target_move_pct > 0:
+        difficulty = target_move_pct / max(available_move, 0.05)
+        base -= min(0.30, max(0.0, difficulty - 0.5) * 0.12)
     return round(max(0.0, min(0.95, base)), 4)
 
 
@@ -191,6 +213,7 @@ def evaluate_sniper_window(
     alt_history: list[dict],
     btc_history: list[dict],
     targets_usdt: list[float] | None = None,
+    target_moves_pct: dict[str, float] | None = None,
     window_seconds: int = SNIPER_WINDOW_SECONDS,
 ) -> dict[str, Any]:
     targets = targets_usdt or [0.5, 1.0, 2.0]
@@ -199,7 +222,14 @@ def evaluate_sniper_window(
     alt_frames = build_multiframe_context(alt_history)
     btc_frames = build_multiframe_context(btc_history)
     btc_state = classify_btc_commander(btc)
-    probabilities = {str(t): _target_probability(alt, btc, t) for t in targets}
+    probabilities = {
+        str(t): _target_probability(
+            alt,
+            btc,
+            float((target_moves_pct or {}).get(str(t), 0.0)),
+        )
+        for t in targets
+    }
     best_target = max(probabilities, key=probabilities.get) if probabilities else "0.5"
     best_probability = probabilities.get(best_target, 0.0)
 

@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 
 from core.feature_engine import FeatureEngine, SYMBOLS
 from core import knowledge_base as kb
+from core.recommendation import recommend_entry, simulate_gate_rejections
 from layers.tactical import run_tactical_loop, get_active_alerts, TacticalAlert
 from layers.strategic import build_strategic_report, report_to_dict, compute_edge_evolution
 from analyst.ai_analyst import (

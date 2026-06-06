@@ -124,10 +124,15 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     symbol TEXT NOT NULL,
     side TEXT NOT NULL,
     decision TEXT NOT NULL,
+    decision_group TEXT NOT NULL DEFAULT 'WAIT',
+    source_type TEXT NOT NULL DEFAULT 'hypothetical',
+    strategy_version TEXT NOT NULL DEFAULT 'legacy',
+    config_hash TEXT NOT NULL DEFAULT '',
     context_key TEXT NOT NULL,
     features TEXT NOT NULL,
     reasons TEXT NOT NULL,
     entry_price REAL NOT NULL,
+    estimated_cost_pct REAL NOT NULL DEFAULT 0,
     target_050_move_pct REAL NOT NULL,
     target_100_move_pct REAL NOT NULL,
     target_200_move_pct REAL NOT NULL,
@@ -139,6 +144,8 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     hit_100 INTEGER,
     hit_200 INTEGER,
     stopped INTEGER,
+    first_event TEXT,
+    first_event_seconds REAL,
     max_favorable_pct REAL,
     max_adverse_pct REAL,
     finalized INTEGER DEFAULT 0,
@@ -177,6 +184,21 @@ CREATE INDEX IF NOT EXISTS idx_news_expires ON news_events(expires_at);
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(CREATE_TABLES)
+        columns = {
+            row[1] for row in await (await db.execute("PRAGMA table_info(signal_outcomes)")).fetchall()
+        }
+        migrations = {
+            "decision_group": "TEXT NOT NULL DEFAULT 'WAIT'",
+            "source_type": "TEXT NOT NULL DEFAULT 'hypothetical'",
+            "strategy_version": "TEXT NOT NULL DEFAULT 'legacy'",
+            "config_hash": "TEXT NOT NULL DEFAULT ''",
+            "estimated_cost_pct": "REAL NOT NULL DEFAULT 0",
+            "first_event": "TEXT",
+            "first_event_seconds": "REAL",
+        }
+        for name, definition in migrations.items():
+            if name not in columns:
+                await db.execute(f"ALTER TABLE signal_outcomes ADD COLUMN {name} {definition}")
         await db.commit()
 
 
@@ -232,10 +254,15 @@ async def record_signal_decision(
     symbol: str,
     side: str,
     decision: str,
+    decision_group: str,
+    source_type: str,
+    strategy_version: str,
+    config_hash: str,
     context_key: str,
     features: dict,
     reasons: list,
     entry_price: float,
+    estimated_cost_pct: float,
     target_moves: dict[str, float],
 ) -> bool:
     if entry_price <= 0:
@@ -244,19 +271,26 @@ async def record_signal_decision(
         try:
             await db.execute(
                 """INSERT INTO signal_outcomes
-                   (signal_id, symbol, side, decision, context_key, features, reasons,
-                    entry_price, target_050_move_pct, target_100_move_pct, target_200_move_pct,
+                   (signal_id, symbol, side, decision, decision_group, source_type,
+                    strategy_version, config_hash, context_key, features, reasons,
+                    entry_price, estimated_cost_pct,
+                    target_050_move_pct, target_100_move_pct, target_200_move_pct,
                     created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     signal_id,
                     symbol,
                     side,
                     decision,
+                    decision_group,
+                    source_type,
+                    strategy_version,
+                    config_hash,
                     context_key,
                     json.dumps(features),
                     json.dumps(reasons),
                     entry_price,
+                    estimated_cost_pct,
                     float(target_moves.get("0.5", 0)),
                     float(target_moves.get("1.0", 0)),
                     float(target_moves.get("2.0", 0)),
@@ -294,6 +328,8 @@ async def finalize_signal_outcome(
     prices: dict[str, float],
     hits: dict[str, bool],
     stopped: bool,
+    first_event: str | None,
+    first_event_seconds: float | None,
     max_favorable_pct: float,
     max_adverse_pct: float,
 ) -> None:
@@ -302,6 +338,7 @@ async def finalize_signal_outcome(
             """UPDATE signal_outcomes
                SET price_30s=?, price_60s=?, price_120s=?, price_300s=?,
                    hit_050=?, hit_100=?, hit_200=?, stopped=?,
+                   first_event=?, first_event_seconds=?,
                    max_favorable_pct=?, max_adverse_pct=?,
                    finalized=1, finalized_at=?
                WHERE signal_id=?""",
@@ -314,6 +351,8 @@ async def finalize_signal_outcome(
                 1 if hits.get("1.0") else 0,
                 1 if hits.get("2.0") else 0,
                 1 if stopped else 0,
+                first_event,
+                first_event_seconds,
                 max_favorable_pct,
                 max_adverse_pct,
                 time.time(),
@@ -327,11 +366,16 @@ async def get_signal_edge_stats(
     symbol: str,
     side: str,
     context_key: str | None = None,
+    decision_group: str = "ALLOW",
+    source_type: str = "hypothetical",
     days: int = 14,
 ) -> dict:
     since = time.time() - days * 86400
-    params: list = [side, since]
-    where = "WHERE finalized=1 AND side=? AND created_at >= ?"
+    params: list = [side, since, decision_group, source_type]
+    where = (
+        "WHERE finalized=1 AND side=? AND created_at >= ? "
+        "AND decision_group=? AND source_type=?"
+    )
     if context_key:
         where += " AND context_key=?"
         params.append(context_key)
@@ -362,6 +406,65 @@ async def get_signal_edge_stats(
         "stop_rate": round(float(d.get("stop_rate") or 0), 4),
         "avg_favorable_pct": round(float(d.get("avg_favorable_pct") or 0), 4),
         "avg_adverse_pct": round(float(d.get("avg_adverse_pct") or 0), 4),
+    }
+
+
+async def get_signal_training_rows(
+    decision_group: str = "ALLOW",
+    source_type: str = "hypothetical",
+    limit: int = 50000,
+) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            """SELECT signal_id, symbol, side, decision, context_key, features,
+                      target_050_move_pct, estimated_cost_pct, hit_050,
+                      stopped, first_event, created_at
+               FROM signal_outcomes
+               WHERE finalized=1 AND decision_group=? AND source_type=?
+               ORDER BY created_at ASC
+               LIMIT ?""",
+            (decision_group, source_type, limit),
+        )).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["features"] = json.loads(item["features"])
+        result.append(item)
+    return result
+
+
+async def get_operational_risk_metrics(hours: int = 24) -> dict:
+    since = time.time() - hours * 3600
+    async with aiosqlite.connect(DB_PATH) as db:
+        rows = await (await db.execute(
+            """SELECT pnl_pct, timestamp
+               FROM trade_outcomes
+               WHERE timestamp >= ?
+               ORDER BY timestamp ASC""",
+            (since,),
+        )).fetchall()
+    cumulative = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    consecutive_losses = 0
+    current_losses = 0
+    for pnl_pct, _ in rows:
+        pnl = float(pnl_pct or 0)
+        cumulative += pnl
+        peak = max(peak, cumulative)
+        max_drawdown = max(max_drawdown, peak - cumulative)
+        if pnl < 0:
+            current_losses += 1
+            consecutive_losses = max(consecutive_losses, current_losses)
+        else:
+            current_losses = 0
+    return {
+        "hours": hours,
+        "trades": len(rows),
+        "netPnlPct": round(cumulative, 6),
+        "maxDrawdownPct": round(max_drawdown, 6),
+        "consecutiveLosses": consecutive_losses,
     }
 
 

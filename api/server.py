@@ -18,6 +18,7 @@ from core import knowledge_base as kb
 from core.recommendation import recommend_entry, simulate_gate_rejections
 from core.edge_gate import evaluate_edge_gate
 from core.movement_sniper import evaluate_sniper_window, build_movement_features, classify_btc_commander
+from core.signal_learning import finalize_due_signal_outcomes, score_signal_context
 from layers.tactical import run_tactical_loop, get_active_alerts, get_snapshot_history, TacticalAlert
 from layers.strategic import build_strategic_report, report_to_dict, compute_edge_evolution
 from analyst.ai_analyst import (
@@ -379,6 +380,64 @@ async def evaluate_edge_endpoint(body: dict):
     return await evaluate_edge_gate(body)
 
 
+@app.post("/signals/finalize")
+async def finalize_signals_endpoint():
+    """Finalize pending signal outcomes after the 300s sniper validation window."""
+    return await finalize_due_signal_outcomes()
+
+
+@app.get("/signals/edge/{symbol}")
+async def get_signal_edge_endpoint(
+    symbol: str,
+    side: str = Query("LONG"),
+    context_key: str = Query(None),
+):
+    """Target-hit memory for sniper signals, including blocked/wait decisions."""
+    sym = symbol.upper()
+    if not sym.endswith("-USDT"):
+        sym = f"{sym}-USDT"
+    return await score_signal_context(sym, side.upper(), context_key or "")
+
+
+@app.post("/news/events")
+async def record_news_event_endpoint(body: dict):
+    """Store a market/news event as risk context for the edge gate."""
+    title = str(body.get("title", "")).strip()
+    if not title:
+        raise HTTPException(400, "Required field: title")
+    symbols = body.get("symbols") or body.get("affectedSymbols") or ["MARKET"]
+    if isinstance(symbols, str):
+        symbols = [symbols]
+    normalized = []
+    for item in symbols:
+        sym = str(item).upper()
+        if sym not in {"MARKET", "BTC-USDT"} and sym.endswith("USDT") and "-" not in sym:
+            sym = f"{sym[:-4]}-USDT"
+        normalized.append(sym)
+    await kb.record_news_event(
+        source=str(body.get("source", "manual")),
+        title=title,
+        symbols=normalized,
+        category=str(body.get("category", "market")),
+        impact_score=float(body.get("impactScore", body.get("impact_score", 0))),
+        risk_level=str(body.get("riskLevel", body.get("risk_level", "LOW"))).upper(),
+        action=str(body.get("action", "context_only")),
+        url=str(body.get("url", "")),
+        raw=body,
+        ttl_seconds=int(body.get("ttlSeconds", body.get("ttl_seconds", 7200))),
+    )
+    return {"ok": True, "symbols": normalized}
+
+
+@app.get("/news/context/{symbol}")
+async def get_news_context_endpoint(symbol: str):
+    """Active news/sentiment risk context for a symbol."""
+    sym = symbol.upper()
+    if not sym.endswith("-USDT") and sym != "MARKET":
+        sym = f"{sym}-USDT"
+    return await kb.get_active_news_context(sym)
+
+
 @app.get("/simulate/gate-rejections")
 async def simulate_gate_rejections_endpoint(
     days: int = Query(30, ge=1, le=365),
@@ -416,5 +475,7 @@ async def root():
             "knowledge_base": ["/kb/patterns", "/kb/observations", "/kb/insights", "/kb/stats", "/kb/trades"],
             "recommendation": ["/recommend/entry", "/simulate/gate-rejections"],
             "edge_gate": ["/edge/evaluate"],
+            "signals": ["/signals/finalize", "/signals/edge/{symbol}"],
+            "news": ["/news/events", "/news/context/{symbol}"],
         }
     }

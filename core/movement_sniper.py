@@ -4,6 +4,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from core.candle_intelligence import build_multiframe_context
+
 
 SNIPER_WINDOW_SECONDS = 300
 
@@ -13,8 +15,14 @@ class MovementFeatures:
     symbol: str
     samples: int
     window_seconds: int
+    first_price: float
+    last_price: float
+    high_price: float
+    low_price: float
     price_change_pct: float
     price_acceleration: float
+    max_favorable_pct: float
+    max_adverse_pct: float
     volume_ratio: float
     oi_change_pct: float
     funding_rate: float
@@ -76,8 +84,14 @@ def build_movement_features(symbol: str, history: list[dict], window_seconds: in
             symbol=symbol,
             samples=0,
             window_seconds=window_seconds,
+            first_price=0.0,
+            last_price=0.0,
+            high_price=0.0,
+            low_price=0.0,
             price_change_pct=0.0,
             price_acceleration=0.0,
+            max_favorable_pct=0.0,
+            max_adverse_pct=0.0,
             volume_ratio=0.0,
             oi_change_pct=0.0,
             funding_rate=0.0,
@@ -89,7 +103,14 @@ def build_movement_features(symbol: str, history: list[dict], window_seconds: in
         )
 
     prices = [float(x.get("price", 0) or 0) for x in history]
+    valid_prices = [p for p in prices if p > 0]
+    first_price = valid_prices[0] if valid_prices else 0.0
+    last_price = valid_prices[-1] if valid_prices else 0.0
+    high_price = max(valid_prices) if valid_prices else 0.0
+    low_price = min(valid_prices) if valid_prices else 0.0
     change_pct = _pct_change(prices[0], prices[-1]) if len(prices) >= 2 else 0.0
+    max_favorable = _pct_change(first_price, high_price) if first_price > 0 else 0.0
+    max_adverse = _pct_change(first_price, low_price) if first_price > 0 else 0.0
     midpoint = max(1, len(prices) // 2)
     early_change = _pct_change(prices[0], prices[midpoint - 1]) if len(prices) >= 4 else 0.0
     late_change = _pct_change(prices[midpoint], prices[-1]) if len(prices) >= 4 else change_pct
@@ -106,8 +127,14 @@ def build_movement_features(symbol: str, history: list[dict], window_seconds: in
         symbol=symbol,
         samples=len(history),
         window_seconds=window_seconds,
+        first_price=round(first_price, 8),
+        last_price=round(last_price, 8),
+        high_price=round(high_price, 8),
+        low_price=round(low_price, 8),
         price_change_pct=round(change_pct, 4),
         price_acceleration=round(acceleration, 4),
+        max_favorable_pct=round(max_favorable, 4),
+        max_adverse_pct=round(max_adverse, 4),
         volume_ratio=round(volume_ratio, 4),
         oi_change_pct=round(oi_change_pct, 4),
         funding_rate=round(funding_rate, 8),
@@ -169,6 +196,8 @@ def evaluate_sniper_window(
     targets = targets_usdt or [0.5, 1.0, 2.0]
     alt = build_movement_features(symbol, alt_history, window_seconds)
     btc = build_movement_features("BTC-USDT", btc_history, window_seconds)
+    alt_frames = build_multiframe_context(alt_history)
+    btc_frames = build_multiframe_context(btc_history)
     btc_state = classify_btc_commander(btc)
     probabilities = {str(t): _target_probability(alt, btc, t) for t in targets}
     best_target = max(probabilities, key=probabilities.get) if probabilities else "0.5"
@@ -204,6 +233,10 @@ def evaluate_sniper_window(
         reasons.append("oi_not_against_move")
     if 35 <= alt.rsi <= 70:
         reasons.append("rsi_healthy")
+    if alt_frames["5m"]["breakoutState"] in {"BREAKOUT_UP", "BREAKOUT_DOWN"}:
+        reasons.append("confirmed_5m_breakout")
+    if alt_frames["1m"]["breakoutState"] == "FAKEOUT":
+        reasons.append("one_minute_fakeout_risk")
 
     return {
         "symbol": symbol,
@@ -220,5 +253,7 @@ def evaluate_sniper_window(
         "btcCommander": btc_state,
         "btcFeatures": btc.__dict__,
         "altFeatures": alt.__dict__,
+        "btcTimeframes": btc_frames,
+        "altTimeframes": alt_frames,
         "learningMode": "movement_first_pnl_auditor",
     }

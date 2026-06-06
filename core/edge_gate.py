@@ -4,7 +4,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from core.movement_sniper import evaluate_sniper_window
+from core import knowledge_base as kb
 from core.recommendation import recommend_entry
+from core.signal_learning import (
+    finalize_due_signal_outcomes,
+    record_signal_from_gate,
+    score_signal_context,
+)
 from layers.tactical import get_snapshot_history
 
 
@@ -104,10 +110,26 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         get_snapshot_history(symbol, 300),
         get_snapshot_history("BTC-USDT", 300),
     )
+    await finalize_due_signal_outcomes()
+    signal_memory = await record_signal_from_gate(symbol, position_side, sniper, config)
+    signal_edge = await score_signal_context(symbol, signal_memory["side"], signal_memory["contextKey"])
+    news_context = await kb.get_active_news_context(symbol)
+
     if sniper["decision"].startswith("BLOCK_"):
         gate_rejects.append(f"SNIPER_{sniper['decision']}: {','.join(sniper['reasons'])}")
     elif sniper["decision"] == "WAIT":
         gate_rejects.append(f"SNIPER_WAIT: {','.join(sniper['reasons'])}")
+
+    if signal_edge["verdict"] == "toxic_context":
+        gate_rejects.append(
+            "SIGNAL_EDGE_REJECT: target-hit context degraded "
+            f"(score {signal_edge['score']:.4f})"
+        )
+
+    if news_context["action"] == "block":
+        gate_rejects.append("NEWS_RISK_REJECT: active high-impact event blocks entries")
+    elif news_context["action"] == "reduce_aggression" and signal_edge["score"] < 0.72:
+        gate_rejects.append("NEWS_RISK_REDUCE: news risk requires stronger target-hit edge")
 
     recommendation = await recommend_entry({
         "symbol": symbol,
@@ -124,9 +146,15 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         gate_rejects.append(f"REALIZED_EDGE_REJECT: score {recommendation.get('score', 0):.4f}")
 
     allow = len(gate_rejects) == 0
-    score = min(float(sniper.get("score", 0.0)), float(recommendation.get("score", 0.5)))
+    score = min(
+        float(sniper.get("score", 0.0)),
+        float(recommendation.get("score", 0.5)),
+        float(signal_edge.get("score", 0.5)),
+    )
+    if news_context["action"] == "reduce_aggression":
+        score = min(score, max(0.0, score - 0.08))
     if samples < recommendation.get("minSamplesForLiveGate", 8):
-        score = float(sniper.get("score", 0.0))
+        score = min(float(sniper.get("score", 0.0)), float(signal_edge.get("score", 0.5)))
 
     return {
         "allow": allow,
@@ -139,6 +167,9 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "hourUtc": hour_utc,
         "btcRegime": btc_regime,
         "sniper": sniper,
+        "signalMemory": signal_memory,
+        "signalEdge": signal_edge,
+        "newsContext": news_context,
         "realizedEdge": recommendation,
         "mode": "movement_first_realized_pnl_auditor",
     }

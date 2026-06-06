@@ -118,12 +118,59 @@ CREATE TABLE IF NOT EXISTS feature_snapshots (
     btc_regime TEXT
 );
 
+CREATE TABLE IF NOT EXISTS signal_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id TEXT NOT NULL UNIQUE,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    context_key TEXT NOT NULL,
+    features TEXT NOT NULL,
+    reasons TEXT NOT NULL,
+    entry_price REAL NOT NULL,
+    target_050_move_pct REAL NOT NULL,
+    target_100_move_pct REAL NOT NULL,
+    target_200_move_pct REAL NOT NULL,
+    price_30s REAL,
+    price_60s REAL,
+    price_120s REAL,
+    price_300s REAL,
+    hit_050 INTEGER,
+    hit_100 INTEGER,
+    hit_200 INTEGER,
+    stopped INTEGER,
+    max_favorable_pct REAL,
+    max_adverse_pct REAL,
+    finalized INTEGER DEFAULT 0,
+    created_at REAL NOT NULL,
+    finalized_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS news_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    title TEXT NOT NULL,
+    url TEXT,
+    symbols TEXT NOT NULL,
+    category TEXT NOT NULL,
+    impact_score REAL NOT NULL,
+    risk_level TEXT NOT NULL,
+    action TEXT NOT NULL,
+    raw TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_patterns_symbol ON patterns(symbol);
 CREATE INDEX IF NOT EXISTS idx_patterns_name ON patterns(name);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trade_outcomes(symbol);
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trade_outcomes(timestamp);
 CREATE INDEX IF NOT EXISTS idx_observations_symbol ON observations(symbol);
 CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_ts ON feature_snapshots(symbol, timestamp);
+CREATE INDEX IF NOT EXISTS idx_signal_context ON signal_outcomes(context_key, side);
+CREATE INDEX IF NOT EXISTS idx_signal_symbol_ts ON signal_outcomes(symbol, created_at);
+CREATE INDEX IF NOT EXISTS idx_signal_finalized ON signal_outcomes(finalized, created_at);
+CREATE INDEX IF NOT EXISTS idx_news_expires ON news_events(expires_at);
 """
 
 
@@ -178,6 +225,220 @@ async def save_feature_snapshot(symbol: str, features: dict):
             )
         )
         await db.commit()
+
+
+async def record_signal_decision(
+    signal_id: str,
+    symbol: str,
+    side: str,
+    decision: str,
+    context_key: str,
+    features: dict,
+    reasons: list,
+    entry_price: float,
+    target_moves: dict[str, float],
+) -> bool:
+    if entry_price <= 0:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                """INSERT INTO signal_outcomes
+                   (signal_id, symbol, side, decision, context_key, features, reasons,
+                    entry_price, target_050_move_pct, target_100_move_pct, target_200_move_pct,
+                    created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    signal_id,
+                    symbol,
+                    side,
+                    decision,
+                    context_key,
+                    json.dumps(features),
+                    json.dumps(reasons),
+                    entry_price,
+                    float(target_moves.get("0.5", 0)),
+                    float(target_moves.get("1.0", 0)),
+                    float(target_moves.get("2.0", 0)),
+                    time.time(),
+                ),
+            )
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False
+
+
+async def get_pending_signal_outcomes(min_age_seconds: int = 300, limit: int = 200) -> list[dict]:
+    cutoff = time.time() - min_age_seconds
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            """SELECT * FROM signal_outcomes
+               WHERE finalized=0 AND created_at <= ?
+               ORDER BY created_at ASC
+               LIMIT ?""",
+            (cutoff, limit),
+        )).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["features"] = json.loads(d["features"])
+            d["reasons"] = json.loads(d["reasons"])
+            result.append(d)
+        return result
+
+
+async def finalize_signal_outcome(
+    signal_id: str,
+    prices: dict[str, float],
+    hits: dict[str, bool],
+    stopped: bool,
+    max_favorable_pct: float,
+    max_adverse_pct: float,
+) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE signal_outcomes
+               SET price_30s=?, price_60s=?, price_120s=?, price_300s=?,
+                   hit_050=?, hit_100=?, hit_200=?, stopped=?,
+                   max_favorable_pct=?, max_adverse_pct=?,
+                   finalized=1, finalized_at=?
+               WHERE signal_id=?""",
+            (
+                prices.get("30"),
+                prices.get("60"),
+                prices.get("120"),
+                prices.get("300"),
+                1 if hits.get("0.5") else 0,
+                1 if hits.get("1.0") else 0,
+                1 if hits.get("2.0") else 0,
+                1 if stopped else 0,
+                max_favorable_pct,
+                max_adverse_pct,
+                time.time(),
+                signal_id,
+            ),
+        )
+        await db.commit()
+
+
+async def get_signal_edge_stats(
+    symbol: str,
+    side: str,
+    context_key: str | None = None,
+    days: int = 14,
+) -> dict:
+    since = time.time() - days * 86400
+    params: list = [side, since]
+    where = "WHERE finalized=1 AND side=? AND created_at >= ?"
+    if context_key:
+        where += " AND context_key=?"
+        params.append(context_key)
+    else:
+        where += " AND symbol=?"
+        params.append(symbol)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        row = await (await db.execute(
+            f"""SELECT COUNT(*) as samples,
+                       AVG(hit_050) as hit_050,
+                       AVG(hit_100) as hit_100,
+                       AVG(hit_200) as hit_200,
+                       AVG(stopped) as stop_rate,
+                       AVG(max_favorable_pct) as avg_favorable_pct,
+                       AVG(max_adverse_pct) as avg_adverse_pct
+                FROM signal_outcomes
+                {where}""",
+            params,
+        )).fetchone()
+    d = dict(row) if row else {}
+    samples = int(d.get("samples") or 0)
+    return {
+        "samples": samples,
+        "hit_050": round(float(d.get("hit_050") or 0), 4),
+        "hit_100": round(float(d.get("hit_100") or 0), 4),
+        "hit_200": round(float(d.get("hit_200") or 0), 4),
+        "stop_rate": round(float(d.get("stop_rate") or 0), 4),
+        "avg_favorable_pct": round(float(d.get("avg_favorable_pct") or 0), 4),
+        "avg_adverse_pct": round(float(d.get("avg_adverse_pct") or 0), 4),
+    }
+
+
+async def record_news_event(
+    source: str,
+    title: str,
+    symbols: list[str],
+    category: str,
+    impact_score: float,
+    risk_level: str,
+    action: str,
+    url: str = "",
+    raw: dict | None = None,
+    ttl_seconds: int = 7200,
+) -> None:
+    now = time.time()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO news_events
+               (source, title, url, symbols, category, impact_score, risk_level,
+                action, raw, created_at, expires_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                source,
+                title,
+                url,
+                json.dumps(symbols),
+                category,
+                impact_score,
+                risk_level,
+                action,
+                json.dumps(raw or {}),
+                now,
+                now + ttl_seconds,
+            ),
+        )
+        await db.commit()
+
+
+async def get_active_news_context(symbol: str, now: float | None = None) -> dict:
+    ts = now or time.time()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            """SELECT * FROM news_events
+               WHERE expires_at >= ?
+               ORDER BY ABS(impact_score) DESC, created_at DESC
+               LIMIT 100""",
+            (ts,),
+        )).fetchall()
+    matched = []
+    symbol_upper = symbol.upper()
+    for r in rows:
+        d = dict(r)
+        symbols = json.loads(d["symbols"])
+        if symbol_upper in symbols or "BTC-USDT" in symbols or "MARKET" in symbols:
+            d["symbols"] = symbols
+            d["raw"] = json.loads(d["raw"])
+            matched.append(d)
+    if not matched:
+        return {
+            "active": False,
+            "newsImpactScore": 0.0,
+            "riskLevel": "LOW",
+            "action": "none",
+            "events": [],
+        }
+    score = sum(float(x["impact_score"]) for x in matched[:5]) / min(5, len(matched))
+    high_risk = any(str(x["risk_level"]).upper() == "HIGH" for x in matched)
+    reduce = any(str(x["action"]).lower() in {"block", "reduce_aggression"} for x in matched)
+    return {
+        "active": True,
+        "newsImpactScore": round(score, 4),
+        "riskLevel": "HIGH" if high_risk else "MEDIUM" if abs(score) >= 0.35 else "LOW",
+        "action": "block" if any(str(x["action"]).lower() == "block" for x in matched) else "reduce_aggression" if reduce else "context_only",
+        "events": matched[:10],
+    }
 
 
 async def upsert_pattern(

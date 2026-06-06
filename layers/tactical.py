@@ -253,11 +253,17 @@ async def run_tactical_loop(engine: FeatureEngine, interval_seconds: int = 5):
     await kb.init_db()
     log.info(f"Tactical loop iniciado (interval={interval_seconds}s)")
     engine.on_snapshot(_process_snapshot)
+    last_signal_finalize = 0.0
 
     while True:
         try:
             snaps = await engine.snapshot_all()
             await _detect_lead_lag(snaps)
+            now = time.time()
+            if now - last_signal_finalize >= 60:
+                from core.signal_learning import finalize_due_signal_outcomes
+                await finalize_due_signal_outcomes()
+                last_signal_finalize = now
         except Exception as e:
             log.error(f"Tactical loop error: {e}")
         await asyncio.sleep(interval_seconds)

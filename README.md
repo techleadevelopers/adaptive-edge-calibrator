@@ -283,6 +283,37 @@ Optional:
 |---|---:|---:|---|
 | `PORT` | No | `9000` | HTTP port used by Uvicorn/FastAPI. |
 | `ANTHROPIC_API_KEY` | No | empty | Enables AI analyst functionality. |
+| `QUANT_BRAIN_API_TOKEN` | No | empty | Protects write/evaluation endpoints; use the same value in the backend. |
+
+## Sniper Learning Safety
+
+The primary learning label follows the executor's configured
+`takeProfitPct` and `stopLossPct`. Fixed `0.50`, `1.00`, and `2.00` USDT
+targets remain auxiliary opportunity metrics.
+
+Signal outcomes:
+
+- use executable ask entry / bid exit for long positions and the inverse for shorts;
+- are limited to the first 300 seconds after the signal;
+- record whether configured target or stop happened first;
+- separate `ALLOW`, `WAIT`, and `BLOCK` samples;
+- separate hypothetical candidates from executed outcomes;
+- include fee, slippage, strategy version, and configuration identity.
+
+The statistical model is shadow-only. Training uses temporal validation and
+only persists a model when its calibrated Brier score beats the historical
+baseline on the held-out period.
+
+Endpoints:
+
+```text
+POST /signals/finalize
+GET  /signals/edge/{symbol}
+POST /models/sniper/train
+GET  /models/sniper/status
+POST /news/events
+GET  /news/context/{symbol}
+```
 
 Example:
 

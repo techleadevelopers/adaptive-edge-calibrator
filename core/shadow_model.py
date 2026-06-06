@@ -23,7 +23,7 @@ def _feature_dict(row: dict[str, Any]) -> dict[str, Any]:
         "symbol": row.get("symbol", ""),
         "side": row.get("side", ""),
         "context_key": row.get("context_key", ""),
-        "target_move_pct": float(row.get("target_050_move_pct", 0) or 0),
+        "target_move_pct": float(row.get("target_configured_move_pct", 0) or 0),
         "estimated_cost_pct": float(row.get("estimated_cost_pct", 0) or 0),
     }
     for prefix, source in (("alt", alt), ("btc", btc)):
@@ -69,7 +69,7 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
         }
 
     x = [_feature_dict(row) for row in rows]
-    y = np.asarray([int(row.get("hit_050") or 0) for row in rows])
+    y = np.asarray([int(row.get("hit_configured") or 0) for row in rows])
     split = max(int(len(rows) * 0.8), 1)
     if len(set(y[:split])) < 2 or len(set(y[split:])) < 2:
         return {"trained": False, "reason": "both_classes_required", "samples": len(rows)}

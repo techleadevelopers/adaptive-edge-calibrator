@@ -65,7 +65,8 @@ def _estimated_cost_pct(alt: MovementFeatures, config: dict[str, Any]) -> float:
     exit_fee_bps = float(config.get("exitFeeBps", config.get("takerFeeBps", 5.0)) or 0)
     slippage_bps = float(config.get("slippageBpsPerSide", 2.0) or 0) * 2
     funding_cost_pct = max(0.0, float(config.get("estimatedFundingCostPct", 0.0) or 0))
-    return max(0.0, (entry_fee_bps + exit_fee_bps + slippage_bps + alt.spread_bps) / 100 + funding_cost_pct)
+    # Bid/ask labeling already captures spread. Add only costs absent from prices.
+    return max(0.0, (entry_fee_bps + exit_fee_bps + slippage_bps) / 100 + funding_cost_pct)
 
 
 def _entry_price(alt: MovementFeatures, side: str) -> float:
@@ -132,6 +133,8 @@ async def record_signal_from_gate(
         str(t): _target_move_pct(t, margin, leverage, estimated_cost_pct)
         for t in TARGETS_USDT
     }
+    target_moves["configured"] = max(0.0, float(config.get("takeProfitPct", 0.15) or 0.15))
+    stop_move_pct = max(0.0, float(config.get("stopLossPct", 0.10) or 0.10))
     created_bucket = int(time.time() // int(config.get("signalDedupeSeconds", 30) or 30))
     signal_id = _signal_id(symbol, side, str(sniper.get("decision", "")), created_bucket, context_key)
     decision = str(sniper.get("decision", "WAIT"))
@@ -145,6 +148,7 @@ async def record_signal_from_gate(
         "target_probabilities": sniper.get("targetProbabilities", {}),
         "estimated_cost_pct": estimated_cost_pct,
         "strategy_version": STRATEGY_VERSION,
+        "stop_move_pct": stop_move_pct,
     }
     recorded = await kb.record_signal_decision(
         signal_id=signal_id,
@@ -232,9 +236,10 @@ async def finalize_due_signal_outcomes() -> dict[str, Any]:
         max_adverse = min(moves) if moves else 0.0
         stop_move_pct = float(
             signal["features"].get("stop_move_pct")
-            or max(float(signal["target_100_move_pct"] or 0), 0.15)
+            or max(float(signal["target_configured_move_pct"] or 0), 0.15)
         )
         target_thresholds = {
+            "configured": float(signal["target_configured_move_pct"] or 0),
             "0.5": float(signal["target_050_move_pct"] or 0),
             "1.0": float(signal["target_100_move_pct"] or 0),
             "2.0": float(signal["target_200_move_pct"] or 0),
@@ -262,17 +267,16 @@ async def finalize_due_signal_outcomes() -> dict[str, Any]:
             target: hit_time is not None and (stop_time is None or hit_time <= stop_time)
             for target, hit_time in target_times.items()
         }
-        stopped = stop_time is not None
-        first_target_time = min((t for t in target_times.values() if t is not None), default=None)
-        if stop_time is not None and (first_target_time is None or stop_time < first_target_time):
+        configured_target_time = target_times["configured"]
+        stopped = stop_time is not None and (
+            configured_target_time is None or stop_time < configured_target_time
+        )
+        if stopped:
             first_event = "STOP"
             first_event_time = stop_time
-        elif first_target_time is not None:
-            first_event = next(
-                name for name, event_time in target_times.items()
-                if event_time == first_target_time
-            )
-            first_event_time = first_target_time
+        elif configured_target_time is not None:
+            first_event = "TARGET_CONFIGURED"
+            first_event_time = configured_target_time
         else:
             first_event = "TIMEOUT"
             first_event_time = window_end
@@ -317,7 +321,7 @@ async def score_signal_context(
         score = 0.5
         verdict = "cold_start"
     else:
-        hit = effective["hit_050"]
+        hit = effective["hit_configured"]
         stop = effective["stop_rate"]
         quality = hit - (stop * 0.65)
         score = max(0.0, min(0.95, 0.35 + quality))

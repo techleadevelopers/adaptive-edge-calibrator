@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     reasons TEXT NOT NULL,
     entry_price REAL NOT NULL,
     estimated_cost_pct REAL NOT NULL DEFAULT 0,
+    target_configured_move_pct REAL,
     target_050_move_pct REAL NOT NULL,
     target_100_move_pct REAL NOT NULL,
     target_200_move_pct REAL NOT NULL,
@@ -140,6 +141,7 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     price_60s REAL,
     price_120s REAL,
     price_300s REAL,
+    hit_configured INTEGER,
     hit_050 INTEGER,
     hit_100 INTEGER,
     hit_200 INTEGER,
@@ -193,6 +195,8 @@ async def init_db():
             "strategy_version": "TEXT NOT NULL DEFAULT 'legacy'",
             "config_hash": "TEXT NOT NULL DEFAULT ''",
             "estimated_cost_pct": "REAL NOT NULL DEFAULT 0",
+            "target_configured_move_pct": "REAL",
+            "hit_configured": "INTEGER",
             "first_event": "TEXT",
             "first_event_seconds": "REAL",
         }
@@ -274,9 +278,10 @@ async def record_signal_decision(
                    (signal_id, symbol, side, decision, decision_group, source_type,
                     strategy_version, config_hash, context_key, features, reasons,
                     entry_price, estimated_cost_pct,
-                    target_050_move_pct, target_100_move_pct, target_200_move_pct,
+                    target_configured_move_pct, target_050_move_pct,
+                    target_100_move_pct, target_200_move_pct,
                     created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     signal_id,
                     symbol,
@@ -291,6 +296,7 @@ async def record_signal_decision(
                     json.dumps(reasons),
                     entry_price,
                     estimated_cost_pct,
+                    float(target_moves.get("configured", 0)),
                     float(target_moves.get("0.5", 0)),
                     float(target_moves.get("1.0", 0)),
                     float(target_moves.get("2.0", 0)),
@@ -337,7 +343,7 @@ async def finalize_signal_outcome(
         await db.execute(
             """UPDATE signal_outcomes
                SET price_30s=?, price_60s=?, price_120s=?, price_300s=?,
-                   hit_050=?, hit_100=?, hit_200=?, stopped=?,
+                   hit_configured=?, hit_050=?, hit_100=?, hit_200=?, stopped=?,
                    first_event=?, first_event_seconds=?,
                    max_favorable_pct=?, max_adverse_pct=?,
                    finalized=1, finalized_at=?
@@ -347,6 +353,7 @@ async def finalize_signal_outcome(
                 prices.get("60"),
                 prices.get("120"),
                 prices.get("300"),
+                1 if hits.get("configured") else 0,
                 1 if hits.get("0.5") else 0,
                 1 if hits.get("1.0") else 0,
                 1 if hits.get("2.0") else 0,
@@ -374,7 +381,7 @@ async def get_signal_edge_stats(
     params: list = [side, since, decision_group, source_type]
     where = (
         "WHERE finalized=1 AND side=? AND created_at >= ? "
-        "AND decision_group=? AND source_type=?"
+        "AND decision_group=? AND source_type=? AND hit_configured IS NOT NULL"
     )
     if context_key:
         where += " AND context_key=?"
@@ -386,6 +393,7 @@ async def get_signal_edge_stats(
         db.row_factory = aiosqlite.Row
         row = await (await db.execute(
             f"""SELECT COUNT(*) as samples,
+                       AVG(hit_configured) as hit_configured,
                        AVG(hit_050) as hit_050,
                        AVG(hit_100) as hit_100,
                        AVG(hit_200) as hit_200,
@@ -400,6 +408,7 @@ async def get_signal_edge_stats(
     samples = int(d.get("samples") or 0)
     return {
         "samples": samples,
+        "hit_configured": round(float(d.get("hit_configured") or 0), 4),
         "hit_050": round(float(d.get("hit_050") or 0), 4),
         "hit_100": round(float(d.get("hit_100") or 0), 4),
         "hit_200": round(float(d.get("hit_200") or 0), 4),
@@ -418,10 +427,11 @@ async def get_signal_training_rows(
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute(
             """SELECT signal_id, symbol, side, decision, context_key, features,
-                      target_050_move_pct, estimated_cost_pct, hit_050,
+                      target_configured_move_pct, estimated_cost_pct, hit_configured,
                       stopped, first_event, created_at
                FROM signal_outcomes
                WHERE finalized=1 AND decision_group=? AND source_type=?
+                 AND hit_configured IS NOT NULL
                ORDER BY created_at ASC
                LIMIT ?""",
             (decision_group, source_type, limit),

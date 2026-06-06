@@ -15,7 +15,7 @@ from core.shadow_model import predict_shadow
 from layers.tactical import get_snapshot_history
 
 
-def _target_moves(config: dict[str, Any], spread_bps: float) -> dict[str, float]:
+def _target_moves(config: dict[str, Any]) -> dict[str, float]:
     margin = max(_num(config.get("marginPerTrade"), 1.0), 0.01)
     leverage = max(_num(config.get("leverage"), 1.0), 1.0)
     notional = margin * leverage
@@ -23,13 +23,14 @@ def _target_moves(config: dict[str, Any], spread_bps: float) -> dict[str, float]
         _num(config.get("entryFeeBps", config.get("takerFeeBps")), 5.0)
         + _num(config.get("exitFeeBps", config.get("takerFeeBps")), 5.0)
         + 2 * _num(config.get("slippageBpsPerSide"), 2.0)
-        + max(0.0, spread_bps)
     )
     costs_pct = fees_bps / 100 + max(0.0, _num(config.get("estimatedFundingCostPct"), 0.0))
-    return {
+    targets = {
         str(target): target / notional * 100 + costs_pct
         for target in (0.5, 1.0, 2.0)
     }
+    targets["configured"] = max(0.0, _num(config.get("takeProfitPct"), 0.15))
+    return targets
 
 
 def _num(value: Any, fallback: float = 0.0) -> float:
@@ -125,8 +126,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
 
     alt_history = get_snapshot_history(symbol, 900)
     btc_history = get_snapshot_history("BTC-USDT", 900)
-    spread_bps = _num(alt_history[-1].get("spread_bps"), 0.0) if alt_history else 0.0
-    target_moves_pct = _target_moves(config, spread_bps)
+    target_moves_pct = _target_moves(config)
     sniper = evaluate_sniper_window(
         symbol,
         alt_history,
@@ -184,10 +184,10 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     margin = max(_num(config.get("marginPerTrade"), 1.0), 0.01)
     leverage = max(_num(config.get("leverage"), 1.0), 1.0)
     cost_pct = float(signal_memory.get("estimatedCostPct", 0.0))
-    target_050_pct = float(signal_memory["targetMovesPct"].get("0.5", 0.0))
-    gross_target_pct = max(0.0, target_050_pct - cost_pct)
+    configured_target_pct = float(signal_memory["targetMovesPct"].get("configured", 0.0))
+    net_target_pct = configured_target_pct - cost_pct
     min_edge_over_cost_pct = _num(config.get("minEdgeOverCostPct"), 0.03)
-    if gross_target_pct <= cost_pct + min_edge_over_cost_pct:
+    if net_target_pct <= min_edge_over_cost_pct:
         gate_rejects.append(
             "COST_EDGE_REJECT: target movement does not clear execution costs and noise"
         )
@@ -196,21 +196,22 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         if signal_edge["context"]["samples"] >= signal_edge["minSamples"]
         else signal_edge["symbolSide"]
     )
-    hit_probability = float(effective_stats.get("hit_050", 0.0))
+    hit_probability = float(effective_stats.get("hit_configured", 0.0))
     stop_move_pct = max(
-        _num(config.get("stopMovePct"), target_moves_pct["1.0"]),
+        _num(config.get("stopMovePct", config.get("stopLossPct")), 0.0),
         0.15,
     )
     notional = margin * leverage
-    loss_usdt = stop_move_pct / 100 * notional
-    net_ev_usdt = hit_probability * 0.5 - (1 - hit_probability) * loss_usdt
+    net_target_usdt = max(0.0, net_target_pct) / 100 * notional
+    loss_usdt = (stop_move_pct + cost_pct) / 100 * notional
+    net_ev_usdt = hit_probability * net_target_usdt - (1 - hit_probability) * loss_usdt
     if effective_stats.get("samples", 0) >= signal_edge["minSamples"] and net_ev_usdt <= 0:
         gate_rejects.append(f"NET_EV_REJECT: expected value {net_ev_usdt:.4f} USDT")
     shadow_ml = predict_shadow({
         "symbol": symbol,
         "side": signal_memory["side"],
         "context_key": signal_memory["contextKey"],
-        "target_050_move_pct": target_moves_pct["0.5"],
+        "target_configured_move_pct": target_moves_pct["configured"],
         "estimated_cost_pct": cost_pct,
         "features": {
             "alt": sniper["altFeatures"],
@@ -267,6 +268,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "estimatedCostPct": round(cost_pct, 6),
             "hitProbability": round(hit_probability, 4),
             "estimatedLossUsdt": round(loss_usdt, 4),
+            "estimatedNetTargetUsdt": round(net_target_usdt, 4),
             "netEvUsdt": round(net_ev_usdt, 4),
         },
         "newsContext": news_context,

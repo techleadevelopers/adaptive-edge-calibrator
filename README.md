@@ -193,6 +193,46 @@ Examples:
 
 This matters because the system target is not maximum activity. The target is maximum quality of accepted entries.
 
+Available endpoint:
+
+```text
+GET /simulate/gate-rejections?days=30&min_avg_pnl=0
+```
+
+The response compares baseline PnL against hypothetical rejection gates by symbol, hour, and BTC regime.
+
+## Entry Recommendation
+
+The recommendation endpoint scores a pending entry using realized PnL history.
+
+```text
+POST /recommend/entry
+```
+
+Example payload:
+
+```json
+{
+  "symbol": "ETH-USDT",
+  "position_side": "LONG",
+  "btc_regime": "BULL",
+  "hour_utc": 14,
+  "shadow_only": true
+}
+```
+
+The endpoint returns:
+
+- `shadowRecommendation`: whether the intelligence layer would allow the entry;
+- `allow`: live gate result, disabled when `shadow_only=true`;
+- `score`: 0-1 realized-edge score;
+- `risk`: `shadow_only`, `scout`, `standard`, `aggressive`, or `reject`;
+- `suggestedMarginUsdt`: suggested capital bucket: `0`, `0.50`, `1.00`, or `2.00`;
+- `reasons`: audit trail for allow/reject;
+- `stats`: symbol, cluster, regime, hour, and recent PnL statistics.
+
+This should run in shadow mode until at least 100-300 closed trades prove that it improves net Realized PnL.
+
 ## Integration With BingX Execution Pipeline
 
 Expected integration flow:
@@ -370,4 +410,7 @@ GET  /kb/stats
 GET  /kb/stats/{symbol}
 POST /kb/trades
 GET  /kb/feature-history/{symbol}
+
+POST /recommend/entry
+GET  /simulate/gate-rejections
 ```

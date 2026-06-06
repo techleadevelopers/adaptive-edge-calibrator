@@ -2,6 +2,8 @@
 Knowledge Base — SQLite persistente para padrões, observações e memória do sistema.
 Acumula aprendizado 24h/dia sobre os 10 ativos.
 """
+from __future__ import annotations
+
 import json
 import time
 import aiosqlite

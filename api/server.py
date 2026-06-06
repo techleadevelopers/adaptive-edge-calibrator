@@ -2,6 +2,8 @@
 API REST — expõe todos os dados do Quant Brain via HTTP.
 Compatível com o dashboard existente e com consultas manuais.
 """
+from __future__ import annotations
+
 import asyncio
 import time
 import os
@@ -297,24 +299,32 @@ async def get_all_stats(days: int = Query(30, ge=1, le=365)):
 @app.post("/kb/trades")
 async def record_trade(body: dict):
     """Registra resultado de um trade na KB (chamado pelo bot Node.js)."""
-    required = ["symbol", "side", "pnl_pct"]
+    required = ["symbol"]
     for r in required:
         if r not in body:
             raise HTTPException(400, f"Campo obrigatório: {r}")
+    side = body.get("positionSide") or body.get("position_side") or body.get("side")
+    if not side:
+        raise HTTPException(400, "Required field: side or positionSide")
+    pnl_pct = body.get("pnl_pct")
+    if pnl_pct is None:
+        realized_pnl = float(body.get("realizedPnl", body.get("realized_pnl", 0)))
+        margin_used = float(body.get("marginUsed", body.get("margin_used", 0)))
+        pnl_pct = (realized_pnl / margin_used * 100) if margin_used > 0 else realized_pnl
     await kb.record_trade_outcome(
         symbol=body["symbol"],
-        side=body["side"],
-        pnl_pct=float(body["pnl_pct"]),
-        entry_price=float(body.get("entry_price", 0)),
-        exit_price=float(body.get("exit_price", 0)),
-        oi_change=float(body.get("oi_change", 0)),
-        funding=float(body.get("funding", 0)),
-        volume_ratio=float(body.get("volume_ratio", 1)),
-        btc_regime=body.get("btc_regime", "NEUTRAL"),
-        rsi=float(body.get("rsi", 50)),
-        ema_cross=body.get("ema_cross", "FLAT"),
+        side=side,
+        pnl_pct=float(pnl_pct),
+        entry_price=float(body.get("entry_price", body.get("entryPrice", 0))),
+        exit_price=float(body.get("exit_price", body.get("exitPrice", 0))),
+        oi_change=float(body.get("oi_change", body.get("oiChange", 0))),
+        funding=float(body.get("funding", body.get("fundingRate", 0))),
+        volume_ratio=float(body.get("volume_ratio", body.get("volumeRatio", 1))),
+        btc_regime=body.get("btc_regime", body.get("btcRegime", "NEUTRAL")),
+        rsi=float(body.get("rsi", body.get("rsiAtEntry", 50))),
+        ema_cross=body.get("ema_cross", body.get("emaCross", "FLAT")),
     )
-    return {"ok": True, "recorded": body["symbol"]}
+    return {"ok": True, "recorded": body["symbol"], "pnl_pct": float(pnl_pct)}
 
 
 @app.get("/kb/feature-history/{symbol}")
@@ -325,6 +335,23 @@ async def get_feature_history(symbol: str, hours: int = Query(24, ge=1, le=168))
         sym = sym + "-USDT"
     history = await kb.get_feature_history(sym, hours)
     return {"symbol": sym, "hours": hours, "count": len(history), "history": history}
+
+
+@app.post("/recommend/entry")
+async def recommend_entry_endpoint(body: dict, days: int = Query(30, ge=1, le=365)):
+    """Entry allow/reject recommendation in shadow mode by default."""
+    if "symbol" not in body:
+        raise HTTPException(400, "Required field: symbol")
+    return await recommend_entry(body, days=days)
+
+
+@app.get("/simulate/gate-rejections")
+async def simulate_gate_rejections_endpoint(
+    days: int = Query(30, ge=1, le=365),
+    min_avg_pnl: float = Query(0.0),
+):
+    """Backtest-style simulation for rejecting losing flow by symbol, hour, or regime."""
+    return await simulate_gate_rejections(days=days, min_avg_pnl=min_avg_pnl)
 
 
 # ─── HEALTH ──────────────────────────────────────────────────────────────────
@@ -352,5 +379,6 @@ async def root():
             "tactical": ["/tactical/alerts", "/tactical/analyze"],
             "strategic": ["/strategic/report", "/strategic/analyze", "/strategic/hypotheses"],
             "knowledge_base": ["/kb/patterns", "/kb/observations", "/kb/insights", "/kb/stats", "/kb/trades"],
+            "recommendation": ["/recommend/entry", "/simulate/gate-rejections"],
         }
     }

@@ -2,6 +2,8 @@
 Feature Engine — coleta dados de mercado da BingX a cada 1s/5s/15s/30s/1min
 para os 10 ativos. Calcula: preço, OI, funding, volume, CVD, spread, volatilidade.
 """
+from __future__ import annotations
+
 import asyncio
 import time
 import os

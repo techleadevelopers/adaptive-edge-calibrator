@@ -9,7 +9,7 @@ import time
 import os
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -19,6 +19,7 @@ from core.recommendation import recommend_entry, simulate_gate_rejections
 from core.edge_gate import evaluate_edge_gate
 from core.movement_sniper import evaluate_sniper_window, build_movement_features, classify_btc_commander
 from core.signal_learning import finalize_due_signal_outcomes, score_signal_context
+from core.shadow_model import shadow_model_status, train_shadow_model
 from layers.tactical import run_tactical_loop, get_active_alerts, get_snapshot_history, TacticalAlert
 from layers.strategic import build_strategic_report, report_to_dict, compute_edge_evolution
 from analyst.ai_analyst import (
@@ -65,6 +66,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def authenticate_internal_api(request: Request, call_next):
+    token = os.environ.get("QUANT_BRAIN_API_TOKEN", "").strip()
+    if token and request.method not in {"GET", "HEAD", "OPTIONS"}:
+        supplied = request.headers.get("X-Quant-Brain-Token", "")
+        authorization = request.headers.get("Authorization", "")
+        if authorization.startswith("Bearer "):
+            supplied = authorization[7:]
+        if supplied != token:
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return await call_next(request)
 
 
 # ─── MARKET DATA ────────────────────────────────────────────────────────────
@@ -386,17 +400,36 @@ async def finalize_signals_endpoint():
     return await finalize_due_signal_outcomes()
 
 
+@app.post("/models/sniper/train")
+async def train_sniper_model_endpoint(min_samples: int = Query(300, ge=100, le=100000)):
+    """Train and validate the calibrated sniper model; authority remains shadow-only."""
+    return await train_shadow_model(min_samples=min_samples)
+
+
+@app.get("/models/sniper/status")
+async def sniper_model_status_endpoint():
+    return shadow_model_status()
+
+
 @app.get("/signals/edge/{symbol}")
 async def get_signal_edge_endpoint(
     symbol: str,
     side: str = Query("LONG"),
     context_key: str = Query(None),
+    decision_group: str = Query("ALLOW"),
+    source_type: str = Query("hypothetical"),
 ):
     """Target-hit memory for sniper signals, including blocked/wait decisions."""
     sym = symbol.upper()
     if not sym.endswith("-USDT"):
         sym = f"{sym}-USDT"
-    return await score_signal_context(sym, side.upper(), context_key or "")
+    return await score_signal_context(
+        sym,
+        side.upper(),
+        context_key or "",
+        decision_group=decision_group.upper(),
+        source_type=source_type.lower(),
+    )
 
 
 @app.post("/news/events")

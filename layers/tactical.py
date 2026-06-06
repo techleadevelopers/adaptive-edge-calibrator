@@ -2,6 +2,8 @@
 Camada Tática — monitora anomalias em tempo real (1s/5s/15s/30s/1min).
 Detecta padrões, gera alertas e salva observações na Knowledge Base.
 """
+from __future__ import annotations
+
 import asyncio
 import time
 import logging

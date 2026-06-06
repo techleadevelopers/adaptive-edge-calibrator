@@ -1,15 +1,264 @@
 # Quant Brain
 
-Servico Python isolado para analise quantitativa, telemetria estrategica e IA tatico/estrategica do ecossistema BingX.
+Quant Brain is a standalone Python intelligence engine designed for edge intelligence, mathematical strategy validation, and positive Realized PnL optimization.
 
-Este projeto roda separado da raiz e separado do backend Node.js. A raiz do monorepo nao deve commitar `quant-brain/`.
+It analyzes historical and real-time transaction telemetry to detect edge drift, simulate gate rejections, identify toxic market contexts, and feed the BingX execution pipeline with high-probability parameters.
 
-## Rodar Local
+This is not an order execution service. It is the research, telemetry, and intelligence layer behind the execution stack.
 
-```bash
+## Objective
+
+The objective is to transform raw market data and realized trade outcomes into actionable quantitative intelligence.
+
+Quant Brain exists to answer operational questions:
+
+- Which symbols are producing real edge after fees and losses?
+- Which hours are toxic and should be blocked?
+- Is BTC regime improving or destroying the current strategy?
+- Is the edge stable, improving, or drifting down?
+- Which setups should be rejected before capital is exposed?
+- Which parameters should be sent to the execution backend?
+- Is the bot producing positive Realized PnL or only high trade count?
+
+The target is not prediction for its own sake. The target is positive realized PnL through measured, repeatable micro-edge.
+
+## Core Design
+
+```text
+Market data
+  -> feature extraction
+  -> tactical anomaly detection
+  -> knowledge base update
+  -> strategic edge report
+  -> AI analysis when configured
+  -> parameter recommendations
+  -> BingX execution pipeline
+```
+
+Quant Brain separates intelligence from execution:
+
+- **Backend Node.js** signs orders, manages sessions, executes BingX calls, and stores realized trade telemetry.
+- **Quant Brain Python** studies market behavior, realized outcomes, edge evolution, toxic contexts, and strategic recommendations.
+
+## What It Does
+
+### Real-Time Market Intelligence
+
+The `FeatureEngine` monitors selected futures symbols and builds live snapshots with:
+
+- price;
+- price change;
+- open interest movement;
+- volume ratio;
+- funding rate;
+- approximate RSI;
+- EMA state;
+- BTC regime;
+- anomaly flags.
+
+These snapshots are exposed through the `/market/*` endpoints.
+
+### Tactical Layer
+
+The tactical layer looks for short-term patterns and active alerts.
+
+It is used to detect conditions such as:
+
+- unusual volume expansion;
+- open interest displacement;
+- BTC regime alignment;
+- fast market anomalies;
+- symbol-specific tactical opportunities.
+
+Endpoints:
+
+```text
+GET  /tactical/alerts
+POST /tactical/analyze
+```
+
+### Strategic Layer
+
+The strategic layer looks at accumulated results over larger windows.
+
+It evaluates:
+
+- edge evolution;
+- win rate migration;
+- average PnL drift;
+- symbol ranking;
+- side-specific performance;
+- structural changes in the strategy;
+- long-term tactical decay.
+
+Endpoints:
+
+```text
+GET  /strategic/report
+GET  /strategic/edge-evolution
+POST /strategic/analyze
+POST /strategic/hypotheses
+```
+
+### Knowledge Base
+
+The Knowledge Base stores operational observations and trade outcomes in SQLite.
+
+It is the memory layer for:
+
+- historical feature snapshots;
+- observed tactical patterns;
+- trade outcomes;
+- symbol statistics;
+- strategic insights;
+- generated hypotheses.
+
+Runtime database:
+
+```text
+data/knowledge.db
+```
+
+This file is private runtime data and must not be committed to Git.
+
+Endpoints:
+
+```text
+GET  /kb/patterns
+GET  /kb/observations
+GET  /kb/insights
+GET  /kb/stats
+GET  /kb/stats/{symbol}
+POST /kb/trades
+GET  /kb/feature-history/{symbol}
+```
+
+## AI Analyst
+
+Quant Brain can run AI-assisted analysis when `ANTHROPIC_API_KEY` is configured.
+
+The AI layer is used for:
+
+- tactical explanation of active alerts;
+- weekly strategic review;
+- hypothesis generation;
+- detecting market regime changes;
+- summarizing why edge may be improving or degrading.
+
+Without `ANTHROPIC_API_KEY`, the system still runs the quantitative layers. AI endpoints return `ai_enabled: false` or operate without external model reasoning.
+
+## Realized PnL Optimization
+
+The engine is designed around Realized PnL, not theoretical signal quality.
+
+Important metrics:
+
+- realized PnL;
+- win rate;
+- average win;
+- average loss;
+- profit factor;
+- edge drift;
+- toxic hours;
+- toxic symbols;
+- BTC regime impact;
+- fee drag;
+- gate rejection quality.
+
+The intended optimization loop:
+
+```text
+trade outcome
+  -> knowledge base
+  -> symbol/hour/regime statistics
+  -> edge drift analysis
+  -> gate recommendation
+  -> backend execution parameters
+  -> fewer low-quality entries
+  -> higher realized PnL quality
+```
+
+## Gate Rejection Simulation
+
+Quant Brain should be used to understand which filters would have prevented losing trades.
+
+Examples:
+
+- reject symbol after negative rolling PnL;
+- reject trading hour with low win rate;
+- reject BTC counter-regime entries;
+- reject setups with poor historical profit factor;
+- reject when recent edge drift is negative;
+- reject when expected gain is smaller than fee/slippage cost.
+
+This matters because the system target is not maximum activity. The target is maximum quality of accepted entries.
+
+## Integration With BingX Execution Pipeline
+
+Expected integration flow:
+
+```text
+BingX execution backend
+  -> closes or records trade
+  -> POST /kb/trades
+  -> Quant Brain updates knowledge base
+  -> strategic/tactical endpoints expose recommendations
+  -> dashboard or backend reads recommendations
+  -> execution gates are adjusted
+```
+
+The Node backend remains responsible for:
+
+- session security;
+- API key handling;
+- HMAC signing;
+- order submission;
+- position management;
+- immediate execution safety.
+
+Quant Brain remains responsible for:
+
+- analysis;
+- edge intelligence;
+- historical learning;
+- AI-assisted reasoning;
+- strategy validation.
+
+## Requirements
+
+Required:
+
+- Python 3.11+
+- pip or uv
+- internet access for market data
+
+Optional:
+
+- `ANTHROPIC_API_KEY` for AI analysis
+- persistent disk if deployed in cloud
+
+## Environment Variables
+
+| Variable | Required | Default | Purpose |
+|---|---:|---:|---|
+| `PORT` | No | `9000` | HTTP port used by Uvicorn/FastAPI. |
+| `ANTHROPIC_API_KEY` | No | empty | Enables AI analyst functionality. |
+
+Example:
+
+```env
+PORT=9000
+ANTHROPIC_API_KEY=
+```
+
+## Local Run
+
+PowerShell:
+
+```powershell
 cd quant-brain
 python -m venv .venv
-.venv\Scripts\Activate.ps1
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python main.py
 ```
@@ -20,30 +269,100 @@ Healthcheck:
 GET http://localhost:9000/health
 ```
 
-## Variaveis
+Expected response shape:
 
-| Variavel | Padrao | Uso |
-|---|---:|---|
-| `PORT` | `9000` | Porta HTTP do FastAPI/Uvicorn. |
-| `ANTHROPIC_API_KEY` | vazio | Habilita analises com IA quando configurada. |
+```json
+{
+  "status": "ok",
+  "ai_enabled": false,
+  "symbols_monitored": 10,
+  "snapshots_cached": 10
+}
+```
 
-## Dados Locais
+## Run With Uvicorn
 
-O arquivo `data/knowledge.db` e runtime data local. Ele guarda conhecimento operacional, padroes e estatisticas. Nao deve ir para Git.
+```powershell
+uvicorn api.server:app --host 0.0.0.0 --port 9000
+```
 
-## Endpoints
+## Repository Rules
+
+This directory is a standalone Git repository.
+
+Commit from inside `quant-brain/`:
+
+```powershell
+cd quant-brain
+git add .
+git commit -m "feat: update quant brain"
+git push
+```
+
+Do not commit:
 
 ```text
+.env
+.venv/
+__pycache__/
+data/knowledge.db
+*.log
+```
+
+## Deployment Notes
+
+For cloud deploy:
+
+- configure the service root as `quant-brain`;
+- install dependencies from `requirements.txt` or `pyproject.toml`;
+- start with `python main.py` or `uvicorn api.server:app --host 0.0.0.0 --port $PORT`;
+- provide persistent storage if `data/knowledge.db` must survive deploys;
+- configure `ANTHROPIC_API_KEY` only in the cloud secret manager.
+
+If the cloud filesystem is ephemeral, `data/knowledge.db` will reset on redeploy. For production intelligence, use persistent volume or migrate the Knowledge Base to managed Postgres.
+
+## Current Limitations
+
+- SQLite database is local file storage.
+- No authentication layer is currently enforced by this service.
+- CORS is permissive.
+- AI analysis depends on Anthropic API availability.
+- Recommendations are exposed through API but not yet enforced automatically by this service.
+
+## Next Technical Advances
+
+Priority improvements:
+
+- add auth token between backend and Quant Brain;
+- move `knowledge.db` to Postgres for durable cloud operation;
+- add endpoint for explicit gate recommendations;
+- add batch import from backend `telemetry.jsonl`;
+- add fee/slippage-aware PnL normalization;
+- add symbol toxicity scoring by rolling window;
+- add hour blacklist recommendation endpoint;
+- add BTC regime impact report by side;
+- add backtest-style gate rejection simulator;
+- add scheduled report export;
+- add dashboard integration for strategic insights.
+
+## Main Endpoints
+
+```text
+GET  /
 GET  /health
+
 GET  /market/snapshots
 GET  /market/snapshots/{symbol}
 GET  /market/anomalies
+
 GET  /tactical/alerts
 POST /tactical/analyze
+
 GET  /strategic/report
 GET  /strategic/edge-evolution
 POST /strategic/analyze
 POST /strategic/hypotheses
+
 GET  /kb/patterns
 GET  /kb/observations
 GET  /kb/insights
@@ -51,15 +370,4 @@ GET  /kb/stats
 GET  /kb/stats/{symbol}
 POST /kb/trades
 GET  /kb/feature-history/{symbol}
-```
-
-## Git
-
-Este diretorio deve ser um repositorio Git proprio:
-
-```bash
-cd quant-brain
-git add .
-git commit -m "feat: update quant brain"
-git push
 ```

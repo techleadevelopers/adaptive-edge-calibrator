@@ -2,6 +2,8 @@
 Camada Estratégica — analisa 1.000/5.000/10.000 trades e semanas/meses de histórico.
 Detecta mudanças estruturais de edge, evolução de win rate por símbolo e lado.
 """
+from __future__ import annotations
+
 import asyncio
 import time
 import logging

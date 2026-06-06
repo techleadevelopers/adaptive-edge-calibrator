@@ -16,7 +16,8 @@ from fastapi.responses import JSONResponse
 from core.feature_engine import FeatureEngine, SYMBOLS
 from core import knowledge_base as kb
 from core.recommendation import recommend_entry, simulate_gate_rejections
-from layers.tactical import run_tactical_loop, get_active_alerts, TacticalAlert
+from core.movement_sniper import evaluate_sniper_window, build_movement_features, classify_btc_commander
+from layers.tactical import run_tactical_loop, get_active_alerts, get_snapshot_history, TacticalAlert
 from layers.strategic import build_strategic_report, report_to_dict, compute_edge_evolution
 from analyst.ai_analyst import (
     run_weekly_analysis, run_tactical_analysis, run_hypothesis_generation, _has_ai
@@ -113,6 +114,30 @@ async def get_anomalies():
             })
     result.sort(key=lambda x: len(x["anomalies"]), reverse=True)
     return {"timestamp": time.time(), "count": len(result), "anomalies": result}
+
+
+@app.get("/sniper/btc-commander")
+async def get_btc_commander(window_seconds: int = Query(300, ge=60, le=900)):
+    """BTC real-time commander for sniper scalp gating."""
+    history = get_snapshot_history("BTC-USDT", window_seconds)
+    features = build_movement_features("BTC-USDT", history, window_seconds)
+    return {
+        "timestamp": time.time(),
+        "windowSeconds": window_seconds,
+        "commander": classify_btc_commander(features),
+        "features": features.__dict__,
+    }
+
+
+@app.get("/sniper/evaluate/{symbol}")
+async def evaluate_sniper_symbol(symbol: str, window_seconds: int = Query(300, ge=60, le=900)):
+    """Evaluate a symbol against BTC movement for short-target sniper entries."""
+    sym = symbol.upper()
+    if not sym.endswith("-USDT"):
+        sym = f"{sym}-USDT"
+    alt_history = get_snapshot_history(sym, window_seconds)
+    btc_history = get_snapshot_history("BTC-USDT", window_seconds)
+    return evaluate_sniper_window(sym, alt_history, btc_history, window_seconds=window_seconds)
 
 
 # ─── TACTICAL ────────────────────────────────────────────────────────────────
@@ -376,6 +401,7 @@ async def root():
         "description": "Motor de análise quantitativa 24h para 10 ativos BingX",
         "endpoints": {
             "market": ["/market/snapshots", "/market/anomalies"],
+            "sniper": ["/sniper/btc-commander", "/sniper/evaluate/{symbol}"],
             "tactical": ["/tactical/alerts", "/tactical/analyze"],
             "strategic": ["/strategic/report", "/strategic/analyze", "/strategic/hypotheses"],
             "knowledge_base": ["/kb/patterns", "/kb/observations", "/kb/insights", "/kb/stats", "/kb/trades"],

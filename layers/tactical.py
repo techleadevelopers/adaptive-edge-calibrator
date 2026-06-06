@@ -45,6 +45,18 @@ def get_active_alerts(max_age_seconds: int = 300) -> list[TacticalAlert]:
     return [a for a in _active_alerts if a.timestamp >= cutoff]
 
 
+def get_snapshot_history(symbol: str, window_seconds: int = 300) -> list[dict]:
+    sym = symbol.upper()
+    if not sym.endswith("-USDT"):
+        sym = f"{sym}-USDT"
+    cutoff = time.time() - window_seconds
+    return [x for x in _snap_buffer[sym] if x.get("timestamp", 0) >= cutoff]
+
+
+def get_all_snapshot_history(window_seconds: int = 300) -> dict[str, list[dict]]:
+    return {sym: get_snapshot_history(sym, window_seconds) for sym in SYMBOLS}
+
+
 def _classify_pattern(snap: MarketSnapshot, history: list[dict]) -> list[str]:
     """Identifica padrões nomeados a partir das condições atuais."""
     patterns = []

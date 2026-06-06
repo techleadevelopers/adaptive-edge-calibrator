@@ -2,6 +2,8 @@
 Camada IA Raciocinadora — usa Claude para analisar dados quant e gerar insights.
 Recebe fatos da Camada 1 (Quant) e produz relatórios estruturados.
 """
+from __future__ import annotations
+
 import asyncio
 import os
 import time

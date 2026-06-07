@@ -33,6 +33,7 @@ from core.edge_gate import evaluate_edge_gate
 from core.movement_sniper import evaluate_sniper_window, build_movement_features, classify_btc_commander
 from core.signal_learning import finalize_due_signal_outcomes, score_signal_context
 from core.shadow_model import restore_shadow_model, shadow_model_status, train_shadow_model
+from core.shadow_sampler import run_shadow_signal_sampler, shadow_sampler_status, sample_shadow_signals_once
 from layers.tactical import run_tactical_loop, get_active_alerts, get_snapshot_history
 from layers.strategic import build_strategic_report, report_to_dict, compute_edge_evolution
 from analyst.ai_analyst import (
@@ -211,7 +212,7 @@ async def _run_model_maintenance_loop():
         try:
             await finalize_due_signal_outcomes()
             await restore_shadow_model()
-            summary = await kb.get_signal_training_summary(decision_group=None)
+            summary = await kb.get_signal_training_summary(decision_group=None, source_type=None)
             status = shadow_model_status()
             trained_samples = int(status.get("samples", 0) or 0)
             samples = int(summary["samples"])
@@ -287,6 +288,13 @@ async def _initialize_runtime_services():
             "Signal finalizer/model maintenance started (%.1fs interval)",
             _MODEL_MAINTENANCE_SECONDS,
         )
+
+        sampler_interval = max(15, int(float(os.environ.get("SHADOW_SAMPLER_INTERVAL_SECONDS", "60"))))
+        sampler_task = asyncio.create_task(
+            run_shadow_signal_sampler(engine, interval_seconds=sampler_interval)
+        )
+        _tasks.append(sampler_task)
+        log.info("Shadow signal sampler started (%ss interval)", sampler_interval)
 
         _runtime_state["services_started"] = True
         return
@@ -820,8 +828,10 @@ async def train_sniper_model_endpoint(min_samples: int = Query(300, ge=100, le=1
 async def sniper_model_status_endpoint():
     await restore_shadow_model()
     status = shadow_model_status()
-    progress = await kb.get_signal_training_summary(decision_group=None)
+    progress = await kb.get_signal_training_summary(decision_group=None, source_type=None)
     pipeline = await kb.get_signal_pipeline_summary()
+    sources = await kb.get_signal_source_summary()
+    recent_shadow = await kb.get_recent_signal_outcomes(limit=10, source_type="shadow_sampler")
     samples = int(progress["samples"])
     return {
         **status,
@@ -834,6 +844,29 @@ async def sniper_model_status_endpoint():
         "hasBothClasses": progress["hasBothClasses"],
         "trainingMode": "automatic_shadow",
         "signalPipeline": pipeline,
+        "signalSources": sources,
+        "shadowSampler": shadow_sampler_status(),
+        "recentShadowSignals": recent_shadow,
+    }
+
+
+@app.get("/signals/shadow-sampler/status")
+async def shadow_sampler_status_endpoint():
+    return {
+        "sampler": shadow_sampler_status(),
+        "pipeline": await kb.get_signal_pipeline_summary(),
+        "sources": await kb.get_signal_source_summary(),
+        "recent": await kb.get_recent_signal_outcomes(limit=20, source_type="shadow_sampler"),
+    }
+
+
+@app.post("/signals/shadow-sampler/run")
+async def run_shadow_sampler_once_endpoint():
+    result = await sample_shadow_signals_once(engine)
+    return {
+        "ok": True,
+        "sampler": shadow_sampler_status(),
+        **result,
     }
 
 

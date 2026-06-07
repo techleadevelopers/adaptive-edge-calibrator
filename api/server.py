@@ -783,6 +783,7 @@ async def train_sniper_model_endpoint(min_samples: int = Query(300, ge=100, le=1
 async def sniper_model_status_endpoint():
     status = shadow_model_status()
     progress = await kb.get_signal_training_summary()
+    pipeline = await kb.get_signal_pipeline_summary()
     samples = int(progress["samples"])
     return {
         **status,
@@ -794,6 +795,7 @@ async def sniper_model_status_endpoint():
         "misses": progress["misses"],
         "hasBothClasses": progress["hasBothClasses"],
         "trainingMode": "automatic_shadow",
+        "signalPipeline": pipeline,
     }
 
 

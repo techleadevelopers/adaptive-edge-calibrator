@@ -27,6 +27,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from core.feature_engine import FeatureEngine, SYMBOLS
 from core import knowledge_base as kb
+from core.database import close_pool, database_schema, using_postgres
 from core.recommendation import recommend_entry, simulate_gate_rejections
 from core.edge_gate import evaluate_edge_gate
 from core.movement_sniper import evaluate_sniper_window, build_movement_features, classify_btc_commander
@@ -312,6 +313,7 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
     await engine.close()
+    await close_pool()
     log.info("✅ Quant Brain encerrado com sucesso")
 
 
@@ -881,6 +883,8 @@ async def health():
         "symbols_monitored": len(SYMBOLS),
         "snapshots_cached": len(snaps),
         "database_ready": _runtime_state["database_ready"],
+        "database_backend": "postgresql" if using_postgres() else "sqlite",
+        "database_schema": database_schema() if using_postgres() else None,
         "services_started": _runtime_state["services_started"],
         "startup_error": _runtime_state["startup_error"],
         "uptime_seconds": round(

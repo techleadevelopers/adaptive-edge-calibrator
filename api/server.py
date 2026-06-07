@@ -837,6 +837,15 @@ async def get_trade_source_summary():
     return await kb.get_trade_source_summary()
 
 
+@app.get("/kb/trades/recent")
+async def get_recent_trade_outcomes(
+    source: str = Query("all", pattern="^(all|demo|live)$"),
+    limit: int = Query(500, ge=1, le=2000),
+):
+    """Trades realizados recentes em formato compatível com o dashboard."""
+    return await kb.get_recent_trade_outcomes(source=source, limit=limit)
+
+
 @app.get("/kb/feature-history/{symbol}")
 @cache_response(ttl_seconds=60)
 async def get_feature_history(symbol: str, hours: int = Query(24, ge=1, le=168)):

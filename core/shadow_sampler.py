@@ -27,14 +27,14 @@ _sampler_state: dict[str, Any] = {
 }
 
 
-def _env_bool(name: str, default: bool) -> bool {
+def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _env_float(name: str, default: float) -> float {
+def _env_float(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name, default))
     except (TypeError, ValueError):

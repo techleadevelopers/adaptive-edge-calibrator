@@ -882,6 +882,8 @@ async def get_trade_source_summary() -> dict:
                       COUNT(*) AS trades,
                       SUM(CASE WHEN win=1 THEN 1 ELSE 0 END) AS wins,
                       SUM(COALESCE(pnl_usdt, 0)) AS pnl_usdt,
+                      SUM(CASE WHEN COALESCE(pnl_usdt, 0) > 0 THEN pnl_usdt ELSE 0 END) AS positive_pnl_usdt,
+                      SUM(CASE WHEN COALESCE(pnl_usdt, 0) < 0 THEN pnl_usdt ELSE 0 END) AS negative_pnl_usdt,
                       MAX(timestamp) AS last_trade_at
                FROM trade_outcomes
                GROUP BY COALESCE(source, 'manual'), COALESCE(is_demo, 0)
@@ -893,8 +895,11 @@ async def get_trade_source_summary() -> dict:
             "isDemo": bool(row[1]),
             "trades": int(row[2] or 0),
             "wins": int(row[3] or 0),
+            "losses": int(row[2] or 0) - int(row[3] or 0),
             "pnlUsdt": round(float(row[4] or 0), 8),
-            "lastTradeAt": float(row[5] or 0),
+            "positivePnlUsdt": round(float(row[5] or 0), 8),
+            "negativePnlUsdt": round(float(row[6] or 0), 8),
+            "lastTradeAt": float(row[7] or 0),
         }
         for row in rows
     ]

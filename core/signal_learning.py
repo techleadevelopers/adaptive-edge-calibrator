@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 import math
 import random
@@ -299,7 +300,17 @@ async def record_signal_from_gate(
 
     target_moves["configured"] = max(0.0, float(config.get("takeProfitPct", 0.15) or 0.15))
     stop_move_pct = max(0.0, float(config.get("stopLossPct", 0.10) or 0.10))
-    created_bucket = int(time.time() // int(config.get("signalDedupeSeconds", 30) or 30))
+    dedupe_seconds = max(
+        OUTCOME_WINDOW_SECONDS,
+        int(
+            config.get(
+                "signalDedupeSeconds",
+                os.environ.get("SIGNAL_DEDUPE_SECONDS", OUTCOME_WINDOW_SECONDS),
+            )
+            or OUTCOME_WINDOW_SECONDS
+        ),
+    )
+    created_bucket = int(time.time() // dedupe_seconds)
     signal_id = _signal_id(symbol, side, str(sniper.get("decision", "")), created_bucket, context_key)
     decision = str(sniper.get("decision", "WAIT"))
     source_type = str(config.get("signalSourceType", "hypothetical")).lower()

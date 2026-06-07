@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import math
+import random
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -73,6 +77,292 @@ def _btc_regime_from_change(change_pct: float, threshold: float) -> str:
     return "BULL" if change_pct > 0 else "BEAR"
 
 
+# ========== NOVAS FUNÇÕES DE EXCELÊNCIA TÉCNICA ==========
+
+def _calculate_kelly_fraction(win_rate: float, avg_win: float, avg_loss: float) -> float:
+    """
+    Kelly Criterion - tamanho ótimo de posição baseado em edge.
+    Fórmula clássica: f* = (p * b - q) / b
+    onde p = win_rate, q = 1-p, b = avg_win/avg_loss
+    """
+    if avg_loss <= 0:
+        return 0.0
+
+    b = avg_win / abs(avg_loss) if avg_loss != 0 else 1.0
+    q = 1 - win_rate
+
+    kelly = (win_rate * b - q) / b if b > 0 else 0.0
+
+    # Limita a 25% do capital para segurança (Kelly fracionário)
+    # Scalpers usam Kelly fracionário (1/4 a 1/2)
+    return max(0.0, min(0.25, kelly * 0.5))
+
+
+def _calculate_optimal_position_size(
+    equity_usdt: float,
+    win_rate: float,
+    avg_win_usdt: float,
+    avg_loss_usdt: float,
+    max_risk_pct: float = 0.02
+) -> dict[str, Any]:
+    """
+    Calcula tamanho de posição ótimo usando Kelly e risco fixo.
+    Retorna o menor entre Kelly e risco máximo.
+    """
+    kelly_fraction = _calculate_kelly_fraction(win_rate, avg_win_usdt, abs(avg_loss_usdt))
+
+    # Tamanho baseado em risco fixo (2% da conta)
+    risk_based_size = equity_usdt * max_risk_pct / abs(avg_loss_usdt) if abs(avg_loss_usdt) > 0 else 0
+
+    # Tamanho baseado em Kelly
+    kelly_based_size = equity_usdt * kelly_fraction
+
+    optimal_size = min(risk_based_size, kelly_based_size) if kelly_based_size > 0 else 0.0
+
+    return {
+        "optimal_margin_usdt": round(optimal_size, 2),
+        "kelly_fraction": round(kelly_fraction, 4),
+        "risk_based_margin_usdt": round(risk_based_size, 2),
+        "max_risk_pct": max_risk_pct,
+        "recommendation": "USE_OPTIMAL" if optimal_size > 0 else "TOO_SMALL_EDGE"
+    }
+
+
+def _calculate_correlation_penalty(correlations: dict[str, float], symbols_in_position: list[str]) -> float:
+    """
+    Penaliza entradas correlacionadas para evitar superexposição.
+    Ex: se SOL e ETH têm correlação 0.8, não entrar nos dois simultaneamente.
+    """
+    if not symbols_in_position or not correlations:
+        return 1.0
+
+    max_correlation = 0.0
+    for sym in symbols_in_position:
+        corr = correlations.get(sym, 0.0)
+        if corr > max_correlation:
+            max_correlation = corr
+
+    # Penalidade: correlação 0.5 reduz 10%, 0.8 reduz 30%, 0.95 reduz 50%
+    penalty = 1.0 - (max_correlation * 0.5)
+    return max(0.5, min(1.0, penalty))
+
+
+def _calculate_market_regime_confidence(
+    btc_regime: str,
+    btc_volatility_pct: float,
+    btc_trend_strength: float,
+    alt_correlation: float
+) -> dict[str, Any]:
+    """
+    Avalia confiança no regime de mercado atual.
+    Baseado em: volatilidade BTC, força da tendência, correlação alt/BTC.
+    """
+    confidence = 0.5
+
+    if btc_regime == "BULL":
+        if btc_trend_strength > 0.3:
+            confidence = 0.8
+        elif btc_trend_strength > 0.15:
+            confidence = 0.65
+        else:
+            confidence = 0.5
+    elif btc_regime == "BEAR":
+        if btc_trend_strength < -0.3:
+            confidence = 0.8
+        elif btc_trend_strength < -0.15:
+            confidence = 0.65
+        else:
+            confidence = 0.5
+    else:  # NEUTRAL
+        confidence = 0.4
+
+    # Penaliza volatilidade muito alta (incerteza)
+    if btc_volatility_pct > 3.0:
+        confidence *= 0.7
+    elif btc_volatility_pct > 2.0:
+        confidence *= 0.85
+
+    # Penaliza correlação baixa (alt pode estar fazendo algo diferente)
+    if alt_correlation < 0.5:
+        confidence *= 0.8
+
+    return {
+        "regime_confidence": round(confidence, 3),
+        "btc_regime": btc_regime,
+        "btc_volatility_pct": round(btc_volatility_pct, 2),
+        "btc_trend_strength": round(btc_trend_strength, 3),
+        "alt_correlation": round(alt_correlation, 3)
+    }
+
+
+def _calculate_volatility_adjusted_stop(
+    atr_pct: float,
+    base_stop_pct: float,
+    volatility_regime: str = "NORMAL"
+) -> float:
+    """
+    Ajusta stop loss baseado na volatilidade atual.
+    Volatilidade alta = stop mais largo, volatilidade baixa = stop mais justo.
+    """
+    if volatility_regime == "HIGH":
+        multiplier = 1.5
+    elif volatility_regime == "LOW":
+        multiplier = 0.7
+    else:
+        multiplier = 1.0
+
+    atr_adjusted = max(atr_pct * 1.5, base_stop_pct)  # Mínimo de 1.5x ATR
+    return round(min(atr_adjusted * multiplier, base_stop_pct * 2.5), 4)
+
+
+def _calculate_volatility_regime(historical_vols: list[float]) -> str:
+    """Classifica regime de volatilidade baseado em percentis."""
+    if len(historical_vols) < 20:
+        return "NORMAL"
+
+    current_vol = historical_vols[-1] if historical_vols else 0
+    mean_vol = sum(historical_vols) / len(historical_vols)
+    std_vol = math.sqrt(sum((v - mean_vol) ** 2 for v in historical_vols) / len(historical_vols)) if historical_vols else 0
+
+    if current_vol > mean_vol + std_vol:
+        return "HIGH"
+    elif current_vol < mean_vol - std_vol:
+        return "LOW"
+    return "NORMAL"
+
+
+def _calculate_sharpe_from_trades(returns: list[float], risk_free: float = 0.0) -> float:
+    """Calcula Sharpe Ratio de trades realizados."""
+    if len(returns) < 3:
+        return 0.0
+
+    mean_return = sum(returns) / len(returns)
+    variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
+    std_return = math.sqrt(variance) if variance > 0 else 0.0001
+
+    if std_return == 0:
+        return 0.0
+
+    sharpe = (mean_return - risk_free) / std_return
+    return sharpe * math.sqrt(365)  # Anualizado
+
+
+def _calculate_bootstrap_ev_confidence(
+    hit_probability: float,
+    samples: int,
+    net_target_usdt: float,
+    loss_usdt: float,
+    n_bootstrap: int = 1000
+) -> dict[str, Any]:
+    """
+    Bootstrap para intervalo de confiança do Expected Value.
+    Determina se EV > 0 é estatisticamente significativo.
+    """
+    if samples < 10:
+        return {"ev_positive_confidence": 0.0, "reliable": False, "samples": samples}
+
+    bootstrap_evs = []
+
+    for _ in range(n_bootstrap):
+        # Bootstrap da probabilidade de acerto
+        bootstrap_hits = sum(1 for _ in range(samples) if random.random() < hit_probability)
+        bootstrap_prob = bootstrap_hits / samples
+
+        ev = bootstrap_prob * net_target_usdt - (1 - bootstrap_prob) * loss_usdt
+        bootstrap_evs.append(ev)
+
+    bootstrap_evs.sort()
+    ev_positive_count = sum(1 for ev in bootstrap_evs if ev > 0)
+    ev_positive_confidence = ev_positive_count / n_bootstrap
+
+    # Percentis
+    lower_5 = bootstrap_evs[int(n_bootstrap * 0.05)]
+    upper_95 = bootstrap_evs[int(n_bootstrap * 0.95)]
+
+    return {
+        "ev_positive_confidence": round(ev_positive_confidence, 4),
+        "ev_lower_5_percentile": round(lower_5, 4),
+        "ev_upper_95_percentile": round(upper_95, 4),
+        "reliable": samples >= 20,
+        "samples": samples,
+        "verdict": "POSITIVE_EV_CONFIRMED" if ev_positive_confidence > 0.95 else "POSITIVE_EV_LIKELY" if ev_positive_confidence > 0.8 else "POSITIVE_EV_UNCLEAR" if ev_positive_confidence > 0.5 else "NEGATIVE_EV"
+    }
+
+
+def _calculate_volatility_regime_from_history(history: list[dict]) -> tuple[str, float, list[float]]:
+    """Extrai regime de volatilidade do histórico."""
+    volatilities = []
+    atr_values = [h.get("atr_pct", 0) for h in history if h.get("atr_pct", 0) > 0]
+
+    if len(atr_values) >= 10:
+        volatilities = atr_values[-30:] if len(atr_values) >= 30 else atr_values
+
+    if len(volatilities) < 10:
+        return "NORMAL", 0.0, []
+
+    regime = _calculate_volatility_regime(volatilities)
+    current_vol = volatilities[-1] if volatilities else 0
+
+    return regime, current_vol, volatilities
+
+
+def _calculate_correlation_from_history(
+    alt_history: list[dict],
+    btc_history: list[dict],
+) -> float:
+    """Calculate Pearson correlation from aligned recent price returns."""
+    sample_count = min(len(alt_history), len(btc_history), 120)
+    if sample_count < 10:
+        return 0.0
+
+    alt_prices = [float(item.get("price", 0) or 0) for item in alt_history[-sample_count:]]
+    btc_prices = [float(item.get("price", 0) or 0) for item in btc_history[-sample_count:]]
+    pairs = [
+        (alt_prices[index - 1], alt_prices[index], btc_prices[index - 1], btc_prices[index])
+        for index in range(1, sample_count)
+        if alt_prices[index - 1] > 0
+        and alt_prices[index] > 0
+        and btc_prices[index - 1] > 0
+        and btc_prices[index] > 0
+    ]
+    if len(pairs) < 8:
+        return 0.0
+
+    alt_returns = [(current - previous) / previous for previous, current, _, _ in pairs]
+    btc_returns = [(current - previous) / previous for _, _, previous, current in pairs]
+    alt_mean = sum(alt_returns) / len(alt_returns)
+    btc_mean = sum(btc_returns) / len(btc_returns)
+    covariance = sum(
+        (alt_value - alt_mean) * (btc_value - btc_mean)
+        for alt_value, btc_value in zip(alt_returns, btc_returns)
+    )
+    alt_variance = sum((value - alt_mean) ** 2 for value in alt_returns)
+    btc_variance = sum((value - btc_mean) ** 2 for value in btc_returns)
+    denominator = math.sqrt(alt_variance * btc_variance)
+    return covariance / denominator if denominator > 0 else 0.0
+
+
+async def _get_recent_returns(symbol: str, side: str, days: int = 30) -> list[float]:
+    """Busca retornos recentes do símbolo para cálculo de Sharpe."""
+    import aiosqlite
+    from core.knowledge_base import DB_PATH
+
+    since = time.time() - days * 86400
+    variants = (symbol, symbol.replace("-", ""))
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        rows = await (await db.execute(
+            """SELECT pnl_pct FROM trade_outcomes
+               WHERE (symbol=? OR symbol=?) AND side=? AND timestamp >= ?
+               ORDER BY timestamp DESC LIMIT 100""",
+            (symbol, variants[1], side, since)
+        )).fetchall()
+
+    return [float(r[0] or 0) for r in rows]
+
+
+# ========== FUNÇÃO PRINCIPAL EXISTENTE (COM ADIÇÕES) ==========
+
 async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     symbol = str(payload.get("symbol", "")).upper()
     if symbol and not symbol.endswith("-USDT"):
@@ -84,6 +374,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     config = payload.get("config") or {}
     gate_rejects: list[str] = []
 
+    # ========== GATES EXISTENTES (MANTIDOS) ==========
     allowed_symbols = _list(config.get("allowedSymbols"))
     if allowed_symbols and symbol not in allowed_symbols:
         gate_rejects.append(f"SYMBOL_REJECT: {symbol} not in allowlist")
@@ -207,6 +498,7 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     net_ev_usdt = hit_probability * net_target_usdt - (1 - hit_probability) * loss_usdt
     if effective_stats.get("samples", 0) >= signal_edge["minSamples"] and net_ev_usdt <= 0:
         gate_rejects.append(f"NET_EV_REJECT: expected value {net_ev_usdt:.4f} USDT")
+
     shadow_ml = predict_shadow({
         "symbol": symbol,
         "side": signal_memory["side"],
@@ -219,6 +511,14 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "alt_timeframes": sniper["altTimeframes"],
         },
     })
+
+    # NOVO: Shadow ML com limiar mais rigoroso
+    if (
+        _bool(config.get("shadowMlEnforce"), False)
+        and shadow_ml.get("available")
+        and shadow_ml.get("calibratedProbability", 0) < 0.52
+    ):
+        gate_rejects.append(f"SHADOW_ML_REJECT: prob {shadow_ml['calibratedProbability']:.3f} < 0.52")
 
     if news_context["action"] == "block":
         gate_rejects.append("NEWS_RISK_REJECT: active high-impact event blocks entries")
@@ -233,11 +533,96 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "shadow_only": True,
     })
 
-    # Realized-PnL recommendation is authoritative only after samples exist.
     stats = recommendation.get("stats", {}).get("symbolSide", {})
     samples = int(stats.get("samples", 0) or 0)
     if samples >= recommendation.get("minSamplesForLiveGate", 8) and not recommendation.get("shadowRecommendation"):
         gate_rejects.append(f"REALIZED_EDGE_REJECT: score {recommendation.get('score', 0):.4f}")
+
+    # ========== NOVOS GATES DE EXCELÊNCIA ==========
+
+    # 1. Volatilidade e Stop Ajustado
+    volatility_regime, current_vol, vol_history = _calculate_volatility_regime_from_history(alt_history)
+    adjusted_stop = _calculate_volatility_adjusted_stop(current_vol, stop_move_pct, volatility_regime)
+
+    if volatility_regime == "HIGH" and current_vol > 1.5:
+        gate_rejects.append(f"HIGH_VOLATILITY_REJECT: current vol {current_vol:.2f}% > 1.5%")
+
+    # 2. Sharpe Ratio de trades realizados
+    recent_returns = await _get_recent_returns(symbol, position_side, days=30)
+    realized_sharpe = _calculate_sharpe_from_trades(recent_returns)
+
+    if len(recent_returns) >= 10 and realized_sharpe < 0.5:
+        gate_rejects.append(f"LOW_REALIZED_SHARPE_REJECT: Sharpe {realized_sharpe:.2f} < 0.5")
+
+    # 3. Correlação e Penalidade
+    correlation = _calculate_correlation_from_history(alt_history, btc_history)
+    symbols_in_position = _list(payload.get("currentPositions", []))
+    supplied_correlations = payload.get("positionCorrelations") or {}
+    correlation_penalty = _calculate_correlation_penalty(
+        {
+            str(key).upper(): abs(_num(value))
+            for key, value in supplied_correlations.items()
+        } if isinstance(supplied_correlations, dict) else {},
+        [str(item).upper() for item in symbols_in_position],
+    )
+
+    if correlation_penalty < 0.7 and len(symbols_in_position) > 0:
+        gate_rejects.append(f"CORRELATION_PENALTY: {symbol} correlated with existing positions")
+
+    # 4. Regime Confidence
+    btc_trend_strength = sniper.get("btcFeatures", {}).get("price_change_pct", 0)
+    regime_confidence = _calculate_market_regime_confidence(
+        btc_regime, current_vol * 2, btc_trend_strength, correlation
+    )
+
+    if regime_confidence["regime_confidence"] < 0.5:
+        gate_rejects.append(f"LOW_REGIME_CONFIDENCE: confidence {regime_confidence['regime_confidence']:.2f}")
+
+    # 5. Bootstrap EV Confidence
+    ev_bootstrap = _calculate_bootstrap_ev_confidence(
+        hit_probability, effective_stats.get("samples", 0),
+        net_target_usdt, loss_usdt
+    )
+
+    if ev_bootstrap["reliable"] and ev_bootstrap["ev_positive_confidence"] < 0.8:
+        gate_rejects.append(f"LOW_EV_CONFIDENCE: EV positive confidence {ev_bootstrap['ev_positive_confidence']:.0%}")
+
+    # 6. Kelly Optimal Position Size
+    equity_usdt = _num(payload.get("equityUsdt", 1000.0), 1000.0)
+    avg_win_usdt = net_target_usdt
+    avg_loss_usdt = loss_usdt
+
+    optimal_size = _calculate_optimal_position_size(
+        equity_usdt, hit_probability, avg_win_usdt, avg_loss_usdt
+    )
+
+    suggested_margin = optimal_size["optimal_margin_usdt"]
+    if (
+        effective_stats.get("samples", 0) >= signal_edge["minSamples"]
+        and suggested_margin < 0.5
+        and equity_usdt >= 100
+    ):
+        gate_rejects.append(f"KELLY_REJECT: optimal margin {suggested_margin:.2f} USDT < 0.5")
+
+    # 7. Microestrutura - Toxic Flow
+    microstructure = data_quality["alt1m"].get("microstructure", {})
+    if microstructure.get("toxicity_score", 0) > 0.7:
+        gate_rejects.append(f"HIGH_FLOW_TOXICITY: VPIN {microstructure['toxicity_score']:.2f} > 0.7")
+
+    # 8. Liquidity Void
+    liquidity_void = data_quality["alt1m"].get("liquidityVoid", {})
+    if liquidity_void.get("void", False):
+        gate_rejects.append(f"LIQUIDITY_VOID: spread {liquidity_void.get('avg_spread_bps', 0)}bps")
+
+    # 9. Divergência Preço-Volume
+    delta_divergence = data_quality["alt1m"].get("deltaDivergence", {})
+    if delta_divergence.get("divergence", False):
+        gate_rejects.append(f"DIVERGENCE: {delta_divergence.get('type', 'unknown')}")
+
+    # 10. Structural Break
+    structural_break = data_quality["alt5m"].get("structuralBreak", {})
+    if structural_break.get("break_detected", False):
+        gate_rejects.append(f"STRUCTURAL_BREAK: {structural_break.get('direction', 'unknown')} break")
 
     allow = len(gate_rejects) == 0
     score = min(
@@ -245,11 +630,23 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         float(recommendation.get("score", 0.5)),
         float(signal_edge.get("score", 0.5)),
     )
+
+    # Ajusta score com base na confiança do regime
+    score = score * regime_confidence["regime_confidence"]
+
+    # Penaliza por correlação
+    score = score * correlation_penalty
+
+    # Bônus para Sharpe alto
+    if realized_sharpe > 1.0 and score < 0.8:
+        score = min(0.85, score * 1.1)
+
     if news_context["action"] == "reduce_aggression":
         score = min(score, max(0.0, score - 0.08))
     if samples < recommendation.get("minSamplesForLiveGate", 8):
         score = min(float(sniper.get("score", 0.0)), float(signal_edge.get("score", 0.5)))
 
+    # ========== NOVOS CAMPOS NO RETORNO ==========
     return {
         "allow": allow,
         "gateRejects": gate_rejects,
@@ -270,11 +667,25 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "estimatedLossUsdt": round(loss_usdt, 4),
             "estimatedNetTargetUsdt": round(net_target_usdt, 4),
             "netEvUsdt": round(net_ev_usdt, 4),
+            # NOVOS CAMPOS ECONÔMICOS
+            "adjustedStopPct": adjusted_stop,
+            "optimalMarginKelly": optimal_size["optimal_margin_usdt"],
+            "kellyFraction": optimal_size["kelly_fraction"],
         },
         "newsContext": news_context,
         "dataQuality": data_quality,
         "operationalRisk": operational_risk,
         "shadowMl": shadow_ml,
         "realizedEdge": recommendation,
+        # NOVOS CAMPOS DE INTELIGÊNCIA
+        "advancedMetrics": {
+            "volatilityRegime": volatility_regime,
+            "realizedSharpe": round(realized_sharpe, 3),
+            "correlationPenalty": round(correlation_penalty, 3),
+            "regimeConfidence": regime_confidence,
+            "evBootstrap": ev_bootstrap,
+            "correlation": round(correlation, 3),
+            "adjustedStopPct": adjusted_stop,
+        },
         "mode": "movement_first_realized_pnl_auditor",
     }

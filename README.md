@@ -387,14 +387,34 @@ For cloud deploy:
 - configure the service root as `quant-brain`;
 - install dependencies from `requirements.txt` or `pyproject.toml`;
 - start with `python main.py` or `uvicorn api.server:app --host 0.0.0.0 --port $PORT`;
-- provide persistent storage if `data/knowledge.db` must survive deploys;
+- configure `DATABASE_URL` with the same Railway Postgres used by the backend;
+- set `QUANT_BRAIN_DB_SCHEMA=quant_brain` so Quant tables remain isolated;
 - configure `ANTHROPIC_API_KEY` only in the cloud secret manager.
 
-If the cloud filesystem is ephemeral, `data/knowledge.db` will reset on redeploy. For production intelligence, use persistent volume or migrate the Knowledge Base to managed Postgres.
+When `DATABASE_URL` or `QUANT_BRAIN_DATABASE_URL` is present, the service creates
+and uses only the configured PostgreSQL schema. Without either variable it falls
+back to `data/knowledge.db` for local development and tests.
+
+Recommended Railway variables:
+
+```text
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+QUANT_BRAIN_DB_SCHEMA=quant_brain
+QUANT_BRAIN_DB_POOL_SIZE=5
+QUANT_BRAIN_DB_COMMAND_TIMEOUT=30
+DB_INIT_TIMEOUT_SECONDS=20
+DB_INIT_RETRY_SECONDS=10
+MODEL_MAINTENANCE_SECONDS=30
+```
+
+Using the same physical Postgres avoids another database service. Schema
+isolation prevents Quant tables from mixing with backend tables. A dedicated
+Postgres role can be added later for stricter permissions without changing the
+application contract.
 
 ## Current Limitations
 
-- SQLite database is local file storage.
+- SQLite is only the local fallback when PostgreSQL is not configured.
 - No authentication layer is currently enforced by this service.
 - CORS is permissive.
 - AI analysis depends on Anthropic API availability.

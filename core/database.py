@@ -56,7 +56,7 @@ def _postgres_ddl(script: str) -> str:
     return script.replace(
         "INTEGER PRIMARY KEY AUTOINCREMENT",
         "BIGSERIAL PRIMARY KEY",
-    )
+    ).replace(" BLOB ", " BYTEA ")
 
 
 async def _get_postgres_pool():
@@ -92,8 +92,9 @@ async def _get_postgres_pool():
 
 
 class PostgresCursor:
-    def __init__(self, rows: Optional[list[Any]] = None):
+    def __init__(self, rows: Optional[list[Any]] = None, rowcount: int = 0):
         self._rows = rows or []
+        self.rowcount = rowcount
 
     async def fetchone(self):
         return self._rows[0] if self._rows else None
@@ -127,8 +128,9 @@ class PostgresConnection:
         if sql.lstrip().upper().startswith(("SELECT", "WITH")):
             rows = await self._connection.fetch(sql, *values)
             return PostgresCursor(list(rows))
-        await self._connection.execute(sql, *values)
-        return PostgresCursor()
+        status = await self._connection.execute(sql, *values)
+        match = re.search(r"(\d+)$", status)
+        return PostgresCursor(rowcount=int(match.group(1)) if match else 0)
 
     async def executescript(self, script: str):
         if self._connection is None:

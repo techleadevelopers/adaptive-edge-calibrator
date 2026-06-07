@@ -42,6 +42,14 @@ log = logging.getLogger("api")
 
 engine = FeatureEngine()
 _tasks: list[asyncio.Task] = []
+_runtime_state = {
+    "database_ready": False,
+    "services_started": False,
+    "startup_error": None,
+    "started_at": time.time(),
+}
+_DB_INIT_TIMEOUT_SECONDS = float(os.environ.get("DB_INIT_TIMEOUT_SECONDS", "20"))
+_DB_INIT_RETRY_SECONDS = float(os.environ.get("DB_INIT_RETRY_SECONDS", "10"))
 
 # ========== NOVAS ESTRUTURAS PARA EXCELÊNCIA ==========
 
@@ -176,6 +184,46 @@ def cache_response(ttl_seconds: int = None):
 
 # ========== LIFESPAN ==========
 
+async def _initialize_runtime_services():
+    """Initialize persistent state without blocking HTTP health probes."""
+    while True:
+        try:
+            await asyncio.wait_for(kb.init_db(), timeout=_DB_INIT_TIMEOUT_SECONDS)
+            await asyncio.wait_for(
+                kb.get_operational_risk_metrics(hours=1),
+                timeout=_DB_INIT_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _runtime_state["database_ready"] = False
+            _runtime_state["startup_error"] = f"{type(exc).__name__}: {exc}"
+            log.exception(
+                "Knowledge Base initialization failed; retrying in %.1fs",
+                _DB_INIT_RETRY_SECONDS,
+            )
+            await asyncio.sleep(_DB_INIT_RETRY_SECONDS)
+            continue
+
+        _runtime_state["database_ready"] = True
+        _runtime_state["startup_error"] = None
+        log.info("Knowledge Base initialized")
+
+        tactical_task = asyncio.create_task(
+            run_tactical_loop(engine, interval_seconds=5)
+        )
+        _tasks.append(tactical_task)
+        log.info("Tactical loop started (5s interval)")
+
+        from layers.strategic import run_strategic_loop
+        strategic_task = asyncio.create_task(run_strategic_loop(interval_hours=6))
+        _tasks.append(strategic_task)
+        log.info("Strategic loop started (6h interval)")
+
+        _runtime_state["services_started"] = True
+        return
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     start_time = time.time()
@@ -183,24 +231,13 @@ async def lifespan(app: FastAPI):
     log.info("🐂 QUANT BRAIN API - Inicializando")
     log.info("=" * 60)
 
-    await kb.init_db()
-    log.info("✅ Knowledge Base inicializada")
+    _runtime_state["database_ready"] = False
+    _runtime_state["services_started"] = False
+    _runtime_state["startup_error"] = None
+    _runtime_state["started_at"] = start_time
 
-    # Verifica integridade do banco
-    try:
-        test = await kb.get_operational_risk_metrics(hours=1)
-        log.info(f"✅ Database OK (trades recentes: {test.get('trades', 0)})")
-    except Exception as e:
-        log.warning(f"⚠️ Database check falhou: {e}")
-
-    t1 = asyncio.create_task(run_tactical_loop(engine, interval_seconds=5))
-    _tasks.append(t1)
-    log.info("✅ Tactical loop iniciado (intervalo 5s)")
-
-    from layers.strategic import run_strategic_loop
-    t2 = asyncio.create_task(run_strategic_loop(interval_hours=6))
-    _tasks.append(t2)
-    log.info("✅ Strategic loop iniciado (intervalo 6h)")
+    bootstrap_task = asyncio.create_task(_initialize_runtime_services())
+    _tasks.append(bootstrap_task)
 
     # Tarefa de limpeza de cache
     async def cache_cleaner():
@@ -217,7 +254,7 @@ async def lifespan(app: FastAPI):
     _tasks.append(t3)
 
     elapsed = time.time() - start_time
-    log.info(f"✅ Quant Brain online em {elapsed:.2f}s — monitorando {len(SYMBOLS)} ativos 24h")
+    log.info(f"✅ Quant Brain HTTP online em {elapsed:.2f}s; runtime initializing")
     log.info(f"📡 API disponível em http://localhost:{os.environ.get('PORT', 9000)}")
     log.info(f"🤖 AI Analyst: {'✅ habilitado' if _has_ai() else '❌ desabilitado'}")
 
@@ -316,25 +353,26 @@ async def get_metrics():
 @app.get("/health/live")
 async def liveness_check():
     """Liveness probe para Kubernetes/Railway."""
-    return {"status": "alive", "timestamp": time.time()}
+    return {
+        "status": "alive",
+        "runtime_ready": _runtime_state["services_started"],
+        "timestamp": time.time(),
+    }
 
 
 @app.get("/health/ready")
 async def readiness_check():
     """Readiness probe - verifica se o sistema está pronto para operar."""
     snaps = engine.get_all_snapshots()
-    db_ok = True
-    try:
-        await kb.get_operational_risk_metrics(hours=1)
-    except Exception:
-        db_ok = False
-
-    ready = len(snaps) > 0 and db_ok
+    db_ok = bool(_runtime_state["database_ready"])
+    ready = bool(_runtime_state["services_started"]) and len(snaps) > 0
 
     return {
         "ready": ready,
         "snapshots_cached": len(snaps),
         "database_ok": db_ok,
+        "services_started": _runtime_state["services_started"],
+        "startup_error": _runtime_state["startup_error"],
         "ai_enabled": _has_ai(),
         "timestamp": time.time()
     }
@@ -781,11 +819,17 @@ async def simulate_gate_rejections_endpoint(
 async def health():
     snaps = engine.get_all_snapshots()
     return {
-        "status": "ok",
+        "status": "ok" if _runtime_state["services_started"] else "initializing",
         "ai_enabled": _has_ai(),
         "symbols_monitored": len(SYMBOLS),
         "snapshots_cached": len(snaps),
-        "uptime_seconds": time.time(),
+        "database_ready": _runtime_state["database_ready"],
+        "services_started": _runtime_state["services_started"],
+        "startup_error": _runtime_state["startup_error"],
+        "uptime_seconds": round(
+            time.time() - float(_runtime_state["started_at"]),
+            3,
+        ),
     }
 
 

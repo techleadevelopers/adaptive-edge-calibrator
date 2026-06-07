@@ -16,6 +16,7 @@ from core.signal_learning import (
     score_signal_context,
 )
 from core.shadow_model import predict_shadow
+from core.database import connect
 from layers.tactical import get_snapshot_history
 
 
@@ -344,13 +345,12 @@ def _calculate_correlation_from_history(
 
 async def _get_recent_returns(symbol: str, side: str, days: int = 30) -> list[float]:
     """Busca retornos recentes do símbolo para cálculo de Sharpe."""
-    import aiosqlite
     from core.knowledge_base import DB_PATH
 
     since = time.time() - days * 86400
     variants = (symbol, symbol.replace("-", ""))
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         rows = await (await db.execute(
             """SELECT pnl_pct FROM trade_outcomes
                WHERE (symbol=? OR symbol=?) AND side=? AND timestamp >= ?

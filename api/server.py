@@ -724,6 +724,8 @@ async def record_trade(body: dict):
 
     recorded = await kb.record_trade_outcome(
         source_id=str(body.get("id") or "") or None,
+        source=str(body.get("source") or "manual"),
+        is_demo=bool(body.get("isDemo", body.get("is_demo", False))),
         symbol=body["symbol"],
         side=side,
         pnl_pct=float(pnl_pct),
@@ -749,6 +751,12 @@ async def record_trade(body: dict):
         "symbol": body["symbol"],
         "pnl_pct": float(pnl_pct),
     }
+
+
+@app.get("/kb/trades/summary")
+async def get_trade_source_summary():
+    """Auditoria de resultados realizados separados por demo/live e origem."""
+    return await kb.get_trade_source_summary()
 
 
 @app.get("/kb/feature-history/{symbol}")

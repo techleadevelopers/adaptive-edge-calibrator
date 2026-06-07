@@ -81,6 +81,8 @@ CREATE TABLE IF NOT EXISTS patterns (
 CREATE TABLE IF NOT EXISTS trade_outcomes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_id TEXT UNIQUE,
+    source TEXT DEFAULT 'manual',
+    is_demo INTEGER DEFAULT 0,
     symbol TEXT NOT NULL,
     side TEXT NOT NULL,
     entry_price REAL,
@@ -392,6 +394,8 @@ async def init_db():
         trade_columns = await table_columns("trade_outcomes", DB_PATH)
         trade_migrations = {
             "source_id": "TEXT",
+            "source": "TEXT DEFAULT 'manual'",
+            "is_demo": "INTEGER DEFAULT 0",
             "pnl_usdt": "REAL",
             "slippage_bps": "REAL DEFAULT 0",
             "fee_paid_usdt": "REAL DEFAULT 0",
@@ -431,6 +435,7 @@ async def init_db():
 async def record_trade_outcome(
     symbol: str, side: str, pnl_pct: float,
     source_id: str | None = None,
+    source: str = "manual", is_demo: bool = False,
     entry_price: float = 0.0, exit_price: float = 0.0,
     oi_change: float = 0.0, funding: float = 0.0,
     volume_ratio: float = 1.0, btc_regime: str = "NEUTRAL",
@@ -443,12 +448,12 @@ async def record_trade_outcome(
     async with connect(DB_PATH) as db:
         cursor = await db.execute(
             """INSERT INTO trade_outcomes
-               (source_id, symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
+               (source_id, source, is_demo, symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
                 oi_at_entry, funding_at_entry, volume_ratio, btc_regime,
                 rsi_at_entry, ema_cross, slippage_bps, fee_paid_usdt, timestamp)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(source_id) DO NOTHING""",
-            (source_id, symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
+            (source_id, source, 1 if is_demo else 0, symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
              oi_change, funding, volume_ratio, btc_regime,
              rsi, ema_cross, slippage_bps, fee_paid_usdt, time.time())
         )
@@ -833,25 +838,28 @@ async def cleanup_retention(now: float | None = None) -> dict[str, int]:
     policies = {
         "feature_snapshots": (
             "timestamp",
-            int(os.environ.get("RETENTION_FEATURE_SNAPSHOTS_HOURS", "72")) * 3600,
+            int(os.environ.get("RETENTION_FEATURE_SNAPSHOTS_HOURS", "24")) * 3600,
         ),
         "signal_outcomes": (
             "created_at",
-            int(os.environ.get("RETENTION_SIGNAL_OUTCOMES_DAYS", "120")) * 86400,
+            int(os.environ.get("RETENTION_SIGNAL_OUTCOMES_DAYS", "60")) * 86400,
         ),
         "news_events": (
             "expires_at",
-            int(os.environ.get("RETENTION_NEWS_EVENTS_DAYS", "7")) * 86400,
+            int(os.environ.get("RETENTION_NEWS_EVENTS_DAYS", "3")) * 86400,
         ),
         "observations": (
             "timestamp",
-            int(os.environ.get("RETENTION_OBSERVATIONS_DAYS", "30")) * 86400,
+            int(os.environ.get("RETENTION_OBSERVATIONS_DAYS", "14")) * 86400,
         ),
         "execution_quality": (
             "timestamp",
-            int(os.environ.get("RETENTION_EXECUTION_QUALITY_DAYS", "30")) * 86400,
+            int(os.environ.get("RETENTION_EXECUTION_QUALITY_DAYS", "14")) * 86400,
         ),
     }
+    trade_days = int(os.environ.get("RETENTION_TRADE_OUTCOMES_DAYS", "0"))
+    if trade_days > 0:
+        policies["trade_outcomes"] = ("timestamp", trade_days * 86400)
     deleted: dict[str, int] = {}
     async with connect(DB_PATH) as db:
         for table, (column, age_seconds) in policies.items():
@@ -864,6 +872,38 @@ async def cleanup_retention(now: float | None = None) -> dict[str, int]:
         await db.commit()
     _query_cache.clear()
     return deleted
+
+
+async def get_trade_source_summary() -> dict:
+    async with connect(DB_PATH) as db:
+        rows = await (await db.execute(
+            """SELECT COALESCE(source, 'manual') AS source,
+                      COALESCE(is_demo, 0) AS is_demo,
+                      COUNT(*) AS trades,
+                      SUM(CASE WHEN win=1 THEN 1 ELSE 0 END) AS wins,
+                      SUM(COALESCE(pnl_usdt, 0)) AS pnl_usdt,
+                      MAX(timestamp) AS last_trade_at
+               FROM trade_outcomes
+               GROUP BY COALESCE(source, 'manual'), COALESCE(is_demo, 0)
+               ORDER BY trades DESC"""
+        )).fetchall()
+    sources = [
+        {
+            "source": str(row[0]),
+            "isDemo": bool(row[1]),
+            "trades": int(row[2] or 0),
+            "wins": int(row[3] or 0),
+            "pnlUsdt": round(float(row[4] or 0), 8),
+            "lastTradeAt": float(row[5] or 0),
+        }
+        for row in rows
+    ]
+    return {
+        "totalTrades": sum(item["trades"] for item in sources),
+        "demoTrades": sum(item["trades"] for item in sources if item["isDemo"]),
+        "liveTrades": sum(item["trades"] for item in sources if not item["isDemo"]),
+        "sources": sources,
+    }
 
 
 async def get_operational_risk_metrics(hours: int = 24) -> dict:

@@ -14,7 +14,11 @@ except ImportError:  # pragma: no cover - SQLite remains available locally.
 
 
 Row = aiosqlite.Row
-IntegrityError = aiosqlite.IntegrityError
+IntegrityError = (
+    (aiosqlite.IntegrityError, asyncpg.IntegrityConstraintViolationError)
+    if asyncpg is not None
+    else aiosqlite.IntegrityError
+)
 
 _SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _postgres_pool = None

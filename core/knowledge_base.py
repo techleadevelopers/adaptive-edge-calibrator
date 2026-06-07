@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS patterns (
 
 CREATE TABLE IF NOT EXISTS trade_outcomes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id TEXT UNIQUE,
     symbol TEXT NOT NULL,
     side TEXT NOT NULL,
     entry_price REAL,
@@ -390,6 +391,7 @@ async def init_db():
         # Migrações para trade_outcomes (campos novos)
         trade_columns = await table_columns("trade_outcomes", DB_PATH)
         trade_migrations = {
+            "source_id": "TEXT",
             "pnl_usdt": "REAL",
             "slippage_bps": "REAL DEFAULT 0",
             "fee_paid_usdt": "REAL DEFAULT 0",
@@ -418,35 +420,44 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_signal_hit_rate "
             "ON signal_outcomes(hit_configured)"
         )
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_source_id "
+            "ON trade_outcomes(source_id)"
+        )
 
         await db.commit()
 
 
 async def record_trade_outcome(
     symbol: str, side: str, pnl_pct: float,
+    source_id: str | None = None,
     entry_price: float = 0.0, exit_price: float = 0.0,
     oi_change: float = 0.0, funding: float = 0.0,
     volume_ratio: float = 1.0, btc_regime: str = "NEUTRAL",
     rsi: float = 50.0, ema_cross: str = "FLAT",
     pnl_usdt: float = 0.0, slippage_bps: float = 0.0,
     fee_paid_usdt: float = 0.0
-):
+) -> bool:
     """Registra outcome de trade com métricas avançadas."""
     win = 1 if pnl_pct > 0 else 0
     async with connect(DB_PATH) as db:
-        await db.execute(
+        cursor = await db.execute(
             """INSERT INTO trade_outcomes
-               (symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
+               (source_id, symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
                 oi_at_entry, funding_at_entry, volume_ratio, btc_regime,
                 rsi_at_entry, ema_cross, slippage_bps, fee_paid_usdt, timestamp)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(source_id) DO NOTHING""",
+            (source_id, symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
              oi_change, funding, volume_ratio, btc_regime,
              rsi, ema_cross, slippage_bps, fee_paid_usdt, time.time())
         )
+        if source_id and int(getattr(cursor, "rowcount", 0) or 0) == 0:
+            return False
         await _update_hourly_metrics(db, symbol, side, pnl_pct, win)
         await _update_daily_metrics(db, symbol, side, pnl_pct, win)
         await db.commit()
+        return True
 
 
 async def _update_hourly_metrics(db: Any, symbol: str, side: str, pnl_pct: float, win: int):

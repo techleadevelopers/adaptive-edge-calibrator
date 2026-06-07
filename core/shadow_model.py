@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 import math
+import os
 from pathlib import Path
 from typing import Any
 from collections import defaultdict
@@ -223,7 +224,8 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
     except ImportError as exc:
         return {"trained": False, "reason": f"ml_dependencies_missing: {exc}"}
 
-    rows = await kb.get_signal_training_rows(decision_group=None)
+    source_filter = os.environ.get("SHADOW_MODEL_SIGNAL_SOURCE_TYPE", "").strip() or None
+    rows = await kb.get_signal_training_rows(decision_group=None, source_type=source_filter)
     if len(rows) < min_samples:
         return {
             "trained": False,

@@ -76,10 +76,17 @@ _CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", 30))
 _CACHEABLE_ENDPOINTS = {"/market/snapshots", "/market/anomalies", "/health", "/"}
 
 
+def _is_liveness_path(request: Request) -> bool:
+    return request.url.path == "/health/live"
+
+
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Middleware de rate limiting por IP."""
 
     async def dispatch(self, request: Request, call_next):
+        if _is_liveness_path(request):
+            return await call_next(request)
+
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
@@ -115,6 +122,9 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
     """Middleware para tracking de requests com ID único."""
 
     async def dispatch(self, request: Request, call_next):
+        if _is_liveness_path(request):
+            return await call_next(request)
+
         request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:8])
         request.state.request_id = request_id
         request.state.start_time = time.time()
@@ -133,6 +143,9 @@ class MetricsMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         global _request_counter, _error_counter
+
+        if _is_liveness_path(request):
+            return await call_next(request)
 
         path = request.url.path
         method = request.method

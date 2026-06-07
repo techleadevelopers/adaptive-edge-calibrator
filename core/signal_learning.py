@@ -20,7 +20,8 @@ TARGETS_USDT = (0.5, 1.0, 2.0)
 OUTCOME_SECONDS = (30, 60, 120, 300)
 MIN_CONTEXT_SAMPLES = 12
 STRATEGY_VERSION = "sniper-v2"
-OUTCOME_WINDOW_SECONDS = 300
+OUTCOME_WINDOW_SECONDS = int(os.environ.get("SIGNAL_OUTCOME_WINDOW_SECONDS", "300"))
+SIGNAL_OUTCOME_MIN_AGE_SECONDS = int(os.environ.get("SIGNAL_OUTCOME_MIN_AGE_SECONDS", str(OUTCOME_WINDOW_SECONDS)))
 PRICE_TOLERANCE_SECONDS = 35
 
 # Cache para contexto e decisões
@@ -402,7 +403,7 @@ def _calculate_sharpe_from_outcome(moves: list[float]) -> float:
 
 async def finalize_due_signal_outcomes() -> dict[str, Any]:
     """Finaliza outcomes pendentes com métricas avançadas."""
-    pending = await kb.get_pending_signal_outcomes(min_age_seconds=300, limit=250)
+    pending = await kb.get_pending_signal_outcomes(min_age_seconds=SIGNAL_OUTCOME_MIN_AGE_SECONDS, limit=250)
     finalized = 0
     results = []
 

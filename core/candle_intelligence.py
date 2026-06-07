@@ -242,6 +242,25 @@ def _detect_order_book_imbalance(history: list[dict[str, Any]]) -> dict[str, Any
     if len(history) < 10:
         return {"imbalance": 0.0, "pressure": "NEUTRAL", "quality": "INSUFFICIENT"}
 
+    real_imbalances = [
+        float(h.get("book_imbalance", 0) or 0)
+        for h in history[-10:]
+        if abs(float(h.get("book_imbalance", 0) or 0)) > 0
+    ]
+    if real_imbalances:
+        imbalance = sum(real_imbalances) / len(real_imbalances)
+        if imbalance > 0.15:
+            pressure = "BUYING_PRESSURE"
+        elif imbalance < -0.15:
+            pressure = "SELLING_PRESSURE"
+        else:
+            pressure = "NEUTRAL"
+        return {
+            "imbalance": round(imbalance, 4),
+            "pressure": pressure,
+            "quality": "GOOD" if len(real_imbalances) >= 5 else "PARTIAL",
+        }
+
     bid_prices = [h.get("bid", 0) for h in history if h.get("bid", 0) > 0]
     ask_prices = [h.get("ask", 0) for h in history if h.get("ask", 0) > 0]
 
@@ -330,9 +349,28 @@ def _detect_delta_divergence(history: list[dict[str, Any]]) -> dict[str, Any]:
 
     prices = [h.get("price", 0) for h in history if h.get("price", 0) > 0]
     volumes = [h.get("volume_ratio", 1) for h in history]
+    cvd_values = [float(h.get("cvd", 0) or 0) for h in history if h.get("cvd", 0) not in (None, 0)]
 
     if len(prices) < 20:
         return {"divergence": False, "type": None, "quality": "NO_DATA"}
+
+    if len(cvd_values) >= 10 and len(prices) >= 10:
+        price_delta = prices[-1] - prices[-10]
+        cvd_delta = cvd_values[-1] - cvd_values[-10]
+        if price_delta > 0 and cvd_delta < 0:
+            return {
+                "divergence": True,
+                "type": "BEARISH_PRICE_CVD",
+                "confidence": 0.72,
+                "action": "AVOID_LONG",
+            }
+        if price_delta < 0 and cvd_delta > 0:
+            return {
+                "divergence": True,
+                "type": "BULLISH_PRICE_CVD",
+                "confidence": 0.72,
+                "action": "AVOID_SHORT",
+            }
 
     # Preço faz high, volume cai = bearish divergence
     recent_start = max(0, len(prices) - 20)

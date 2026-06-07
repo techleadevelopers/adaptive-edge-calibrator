@@ -33,8 +33,9 @@ from core.edge_gate import evaluate_edge_gate
 from core.movement_sniper import evaluate_sniper_window, build_movement_features, classify_btc_commander
 from core.signal_learning import finalize_due_signal_outcomes, score_signal_context
 from core.shadow_model import restore_shadow_model, shadow_model_status, train_shadow_model
-from core.shadow_sampler import run_shadow_signal_sampler, shadow_sampler_status, sample_shadow_signals_once
-from layers.tactical import run_tactical_loop, get_active_alerts, get_snapshot_history
+from core.shadow_sampler import shadow_sampler_status, sample_shadow_signals_once
+from core.job_supervisor import JobSupervisor
+from layers.tactical import process_tactical_cycle, get_active_alerts, get_snapshot_history
 from layers.strategic import build_strategic_report, report_to_dict, compute_edge_evolution
 from analyst.ai_analyst import (
     run_weekly_analysis, run_tactical_analysis, run_hypothesis_generation, _has_ai
@@ -54,6 +55,15 @@ _DB_INIT_TIMEOUT_SECONDS = float(os.environ.get("DB_INIT_TIMEOUT_SECONDS", "20")
 _DB_INIT_RETRY_SECONDS = float(os.environ.get("DB_INIT_RETRY_SECONDS", "10"))
 _MODEL_MAINTENANCE_SECONDS = float(os.environ.get("MODEL_MAINTENANCE_SECONDS", "120"))
 _TACTICAL_LOOP_SECONDS = max(5, int(float(os.environ.get("TACTICAL_LOOP_SECONDS", "15"))))
+_JOB_MAX_CONCURRENCY = max(1, int(os.environ.get("JOB_MAX_CONCURRENCY", "2")))
+_JOB_STALE_AFTER_SECONDS = max(30, int(float(os.environ.get("JOB_STALE_AFTER_SECONDS", "120"))))
+_TACTICAL_JOB_TIMEOUT_SECONDS = max(5, int(float(os.environ.get("TACTICAL_JOB_TIMEOUT_SECONDS", "20"))))
+_SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS = max(5, int(float(os.environ.get("SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS", "25"))))
+_MODEL_JOB_TIMEOUT_SECONDS = max(10, int(float(os.environ.get("MODEL_JOB_TIMEOUT_SECONDS", "45"))))
+job_supervisor = JobSupervisor(
+    max_concurrent_jobs=_JOB_MAX_CONCURRENCY,
+    stale_after_seconds=_JOB_STALE_AFTER_SECONDS,
+)
 _RETENTION_MAINTENANCE_SECONDS = float(
     os.environ.get("RETENTION_MAINTENANCE_SECONDS", "3600")
 )
@@ -206,39 +216,43 @@ def cache_response(ttl_seconds: int = None):
 
 # ========== LIFESPAN ==========
 
-async def _run_model_maintenance_loop():
+async def _run_model_maintenance_once():
     global _last_model_training_attempt_samples, _last_retention_maintenance_at
 
+    await finalize_due_signal_outcomes()
+    await restore_shadow_model()
+    summary = await kb.get_signal_training_summary(decision_group=None, source_type=None)
+    status = shadow_model_status()
+    trained_samples = int(status.get("samples", 0) or 0)
+    samples = int(summary["samples"])
+    needs_initial_train = not status.get("available") and samples >= 300
+    needs_refresh = status.get("available") and samples >= trained_samples + 100
+    unseen_attempt = samples > _last_model_training_attempt_samples
+
+    if (
+        (needs_initial_train or needs_refresh)
+        and summary["hasBothClasses"]
+        and unseen_attempt
+    ):
+        _last_model_training_attempt_samples = samples
+        result = await train_shadow_model(min_samples=300)
+        log.info(
+            "Shadow model training completed: trained=%s samples=%s reason=%s",
+            result.get("trained"),
+            samples,
+            result.get("reason"),
+        )
+    if time.time() - _last_retention_maintenance_at >= _RETENTION_MAINTENANCE_SECONDS:
+        deleted = await kb.cleanup_retention()
+        _last_retention_maintenance_at = time.time()
+        if any(deleted.values()):
+            log.info("Retention cleanup completed: %s", deleted)
+
+
+async def _run_model_maintenance_loop():
     while True:
         try:
-            await finalize_due_signal_outcomes()
-            await restore_shadow_model()
-            summary = await kb.get_signal_training_summary(decision_group=None, source_type=None)
-            status = shadow_model_status()
-            trained_samples = int(status.get("samples", 0) or 0)
-            samples = int(summary["samples"])
-            needs_initial_train = not status.get("available") and samples >= 300
-            needs_refresh = status.get("available") and samples >= trained_samples + 100
-            unseen_attempt = samples > _last_model_training_attempt_samples
-
-            if (
-                (needs_initial_train or needs_refresh)
-                and summary["hasBothClasses"]
-                and unseen_attempt
-            ):
-                _last_model_training_attempt_samples = samples
-                result = await train_shadow_model(min_samples=300)
-                log.info(
-                    "Shadow model training completed: trained=%s samples=%s reason=%s",
-                    result.get("trained"),
-                    samples,
-                    result.get("reason"),
-                )
-            if time.time() - _last_retention_maintenance_at >= _RETENTION_MAINTENANCE_SECONDS:
-                deleted = await kb.cleanup_retention()
-                _last_retention_maintenance_at = time.time()
-                if any(deleted.values()):
-                    log.info("Retention cleanup completed: %s", deleted)
+            await _run_model_maintenance_once()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -276,24 +290,42 @@ async def _initialize_runtime_services():
         _runtime_state["startup_error"] = f"{type(exc).__name__}: {exc}"
         log.exception("Knowledge Base initialization failed - continuing anyway")
 
-    # 🔥 SEMPRE inicia os serviços, mesmo se o KB falhou
-    tactical_task = asyncio.create_task(run_tactical_loop(engine, interval_seconds=_TACTICAL_LOOP_SECONDS))
-    _tasks.append(tactical_task)
-    log.info(f"Tactical loop started ({_TACTICAL_LOOP_SECONDS}s interval)")
+    # Runtime jobs are supervised with bounded concurrency, timeouts, and
+    # heartbeat metrics. This keeps HTTP liveness independent from heavy loops.
+    job_supervisor.register(
+        "tactical_market_cycle",
+        lambda: process_tactical_cycle(engine),
+        interval_seconds=_TACTICAL_LOOP_SECONDS,
+        timeout_seconds=_TACTICAL_JOB_TIMEOUT_SECONDS,
+        priority="market",
+    )
 
     from layers.strategic import run_strategic_loop
     strategic_task = asyncio.create_task(run_strategic_loop(interval_hours=6))
     _tasks.append(strategic_task)
     log.info("Strategic loop started (6h interval)")
 
-    model_task = asyncio.create_task(_run_model_maintenance_loop())
-    _tasks.append(model_task)
-    log.info(f"Signal finalizer/model maintenance started ({_MODEL_MAINTENANCE_SECONDS:.1f}s interval)")
+    job_supervisor.register(
+        "model_maintenance",
+        _run_model_maintenance_once,
+        interval_seconds=_MODEL_MAINTENANCE_SECONDS,
+        timeout_seconds=_MODEL_JOB_TIMEOUT_SECONDS,
+        priority="low",
+    )
+    log.info(f"Signal finalizer/model maintenance registered ({_MODEL_MAINTENANCE_SECONDS:.1f}s interval)")
 
     sampler_interval = max(15, int(float(os.environ.get("SHADOW_SAMPLER_INTERVAL_SECONDS", "60"))))
-    sampler_task = asyncio.create_task(run_shadow_signal_sampler(engine, interval_seconds=sampler_interval))
-    _tasks.append(sampler_task)
-    log.info(f"Shadow signal sampler started ({sampler_interval}s interval)")
+    job_supervisor.register(
+        "shadow_signal_sampler",
+        lambda: sample_shadow_signals_once(engine),
+        interval_seconds=sampler_interval,
+        timeout_seconds=_SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS,
+        priority="low",
+        enabled=os.environ.get("SHADOW_SAMPLER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
+    )
+    job_supervisor.start()
+    log.info(f"Runtime job supervisor started with {len(job_supervisor.jobs)} jobs")
+
 
     _runtime_state["services_started"] = True
     return
@@ -336,6 +368,7 @@ async def lifespan(app: FastAPI):
     yield
 
     log.info("🛑 Encerrando Quant Brain...")
+    await job_supervisor.stop()
     for t in _tasks:
         t.cancel()
         try:
@@ -411,7 +444,8 @@ async def get_metrics():
         "cache": {
             "size": len(_response_cache),
             "ttl_seconds": _CACHE_TTL_SECONDS,
-        }
+        },
+        "jobs": job_supervisor.status(),
     }
 
     for endpoint, stats in _endpoint_stats.items():
@@ -430,6 +464,10 @@ async def liveness_check():
     return {
         "status": "alive",
         "runtime_ready": _runtime_state["services_started"],
+        "job_supervisor": {
+            "staleJobs": job_supervisor.status()["staleJobs"],
+            "maxConcurrentJobs": job_supervisor.status()["maxConcurrentJobs"],
+        },
         "timestamp": time.time(),
     }
 
@@ -439,7 +477,8 @@ async def readiness_check():
     """Readiness probe - verifica se o sistema está pronto para operar."""
     snaps = engine.get_all_snapshots()
     db_ok = bool(_runtime_state["database_ready"])
-    ready = bool(_runtime_state["services_started"]) and len(snaps) > 0
+    jobs = job_supervisor.status()
+    ready = bool(_runtime_state["services_started"]) and len(snaps) > 0 and not jobs["staleJobs"]
 
     return {
         "ready": ready,
@@ -447,6 +486,7 @@ async def readiness_check():
         "database_ok": db_ok,
         "services_started": _runtime_state["services_started"],
         "startup_error": _runtime_state["startup_error"],
+        "jobs": jobs,
         "ai_enabled": _has_ai(),
         "timestamp": time.time()
     }
@@ -978,6 +1018,7 @@ async def health():
         "database_schema": database_schema() if using_postgres() else None,
         "services_started": _runtime_state["services_started"],
         "startup_error": _runtime_state["startup_error"],
+        "jobs": job_supervisor.status(),
         "uptime_seconds": round(
             time.time() - float(_runtime_state["started_at"]),
             3,

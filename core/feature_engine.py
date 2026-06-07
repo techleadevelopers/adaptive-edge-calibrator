@@ -150,6 +150,19 @@ class FeatureEngine:
                 return 0.0
         return 0.0
 
+    async def fetch_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> list[dict]:
+        r = await self._get("/openApi/swap/v2/quote/klines", {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": str(limit),
+        })
+        if r.get("code") != 0:
+            return []
+        data = r.get("data", [])
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, dict)]
+
     async def fetch_orderbook(self, symbol: str, depth: int = 10) -> tuple[float, float, float, float, float, float]:
         """
         Busca order book com profundidade para análise de liquidez.

@@ -424,7 +424,6 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         btc_history,
         target_moves_pct=target_moves_pct,
     )
-    await finalize_due_signal_outcomes()
     signal_memory = await record_signal_from_gate(symbol, position_side, sniper, config)
     signal_edge = await score_signal_context(symbol, signal_memory["side"], signal_memory["contextKey"])
     news_context = await kb.get_active_news_context(symbol)

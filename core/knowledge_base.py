@@ -446,6 +446,27 @@ async def record_trade_outcome(
     """Registra outcome de trade com métricas avançadas."""
     win = 1 if pnl_pct > 0 else 0
     async with connect(DB_PATH) as db:
+        if source_id:
+            existing = await (await db.execute(
+                "SELECT id FROM trade_outcomes WHERE source_id=?",
+                (source_id,),
+            )).fetchone()
+            if existing:
+                await db.execute(
+                    """UPDATE trade_outcomes
+                       SET source=?, is_demo=?, symbol=?, side=?, entry_price=?, exit_price=?,
+                           pnl_pct=?, pnl_usdt=?, win=?, oi_at_entry=?, funding_at_entry=?,
+                           volume_ratio=?, btc_regime=?, rsi_at_entry=?, ema_cross=?,
+                           slippage_bps=?, fee_paid_usdt=?, timestamp=?
+                       WHERE source_id=?""",
+                    (source, 1 if is_demo else 0, symbol, side, entry_price, exit_price,
+                     pnl_pct, pnl_usdt, win, oi_change, funding,
+                     volume_ratio, btc_regime, rsi, ema_cross,
+                     slippage_bps, fee_paid_usdt, time.time(), source_id)
+                )
+                await db.commit()
+                return True
+
         cursor = await db.execute(
             """INSERT INTO trade_outcomes
                (source_id, source, is_demo, symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
@@ -969,6 +990,77 @@ async def get_trade_source_summary() -> dict:
         "liveTrades": sum(item["trades"] for item in sources if not item["isDemo"]),
         "sources": sources,
     }
+
+
+async def get_recent_trade_outcomes(source: str = "all", limit: int = 500) -> list[dict]:
+    source = (source or "all").lower()
+    limit = max(1, min(int(limit or 500), 2000))
+    where = ""
+    params: list[Any] = []
+    if source == "demo":
+        where = "WHERE COALESCE(is_demo, 0)=1 OR COALESCE(source, '')='bingx-vst'"
+    elif source == "live":
+        where = "WHERE COALESCE(is_demo, 0)=0 AND COALESCE(source, '')!='bingx-vst'"
+
+    params.append(limit)
+    async with connect(DB_PATH) as db:
+        rows = await (await db.execute(
+            f"""SELECT id, source_id, COALESCE(source, 'manual') AS source,
+                      COALESCE(is_demo, 0) AS is_demo,
+                      symbol, side, entry_price, exit_price, pnl_pct,
+                      pnl_usdt, win, btc_regime, slippage_bps,
+                      fee_paid_usdt, timestamp
+               FROM trade_outcomes
+               {where}
+               ORDER BY timestamp DESC
+               LIMIT ?""",
+            tuple(params),
+        )).fetchall()
+
+    outcomes: list[dict] = []
+    for row in rows:
+        pnl_pct = float(row[8] or 0)
+        pnl_usdt = float(row[9] or 0)
+        fee = abs(float(row[13] or 0))
+        margin_used = abs(pnl_usdt / (pnl_pct / 100)) if pnl_pct else 1.0
+        if margin_used <= 0:
+            margin_used = 1.0
+        source_name = str(row[2] or "manual")
+        is_demo = bool(row[3]) or source_name == "bingx-vst"
+        side = str(row[5] or "LONG").upper()
+        position_side = "SHORT" if side == "SHORT" else "LONG"
+        timestamp = float(row[14] or 0)
+        entry_price = float(row[6] or 0) or 1.0
+        exit_price = float(row[7] or 0) or entry_price
+        outcomes.append({
+            "id": str(row[1] or f"quant-{row[0]}"),
+            "source": source_name,
+            "isDemo": is_demo,
+            "symbol": str(row[4]),
+            "positionSide": position_side,
+            "side": "SELL" if position_side == "SHORT" else "BUY",
+            "entryTime": timestamp,
+            "exitTime": timestamp,
+            "hourUtc": int(time.gmtime(timestamp).tm_hour) if timestamp > 0 else 0,
+            "btcRegime": str(row[11] or "NEUTRAL"),
+            "entryPrice": entry_price,
+            "exitPrice": exit_price,
+            "qty": 1.0,
+            "leverage": 1.0,
+            "marginUsed": round(margin_used, 8),
+            "grossPnl": round(pnl_usdt + fee, 8),
+            "fee": fee,
+            "realizedPnl": pnl_usdt,
+            "pnlSource": "balance_delta",
+            "estimated": False,
+            "entrySlippage": 0.0,
+            "exitSlippage": 0.0,
+            "totalSlippage": 0.0,
+            "slippagePctNotional": abs(float(row[12] or 0)) / 10000,
+            "exitReason": "TP" if pnl_usdt > 0 else "SL" if pnl_usdt < 0 else "MANUAL",
+            "expectedTpProfit": abs(pnl_usdt),
+        })
+    return outcomes
 
 
 async def get_operational_risk_metrics(hours: int = 24) -> dict:

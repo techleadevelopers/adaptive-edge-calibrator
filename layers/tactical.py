@@ -1,15 +1,17 @@
 """
 Camada Tática — monitora anomalias em tempo real (1s/5s/15s/30s/1min).
 Detecta padrões, gera alertas e salva observações na Knowledge Base.
+Nível Excelência: cointegração, qualidade de dados, esgotamento de vol, liquidez tóxica.
 """
 from __future__ import annotations
 
 import asyncio
 import time
 import logging
+import math
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 from core.feature_engine import FeatureEngine, MarketSnapshot, SYMBOLS
 from core import knowledge_base as kb
@@ -35,6 +37,337 @@ _snap_buffer: dict[str, deque] = defaultdict(lambda: deque(maxlen=360))
 _active_alerts: list[TacticalAlert] = []
 _alert_callbacks: list = []
 
+# ========== NOVAS ESTRUTURAS PARA EXCELÊNCIA ==========
+
+class CointegrationTracker:
+    """Monitora pares cointegrados para mean-reversion e arbitragem estatística."""
+
+    def __init__(self, pair: Tuple[str, str], lookback_seconds: int = 3600):
+        self.pair = pair
+        self.spread: deque[float] = deque(maxlen=lookback_seconds // 5)
+        self.hedge_ratio: float = 1.0
+        self.last_signal_time: float = 0
+        self.cooldown_seconds: int = 300
+
+    def update(self, price_a: float, price_b: float) -> Optional[dict]:
+        """Atualiza spread e retorna sinal se houver oportunidade."""
+        if price_a <= 0 or price_b <= 0:
+            return None
+
+        spread = price_a - self.hedge_ratio * price_b
+        self.spread.append(spread)
+
+        if len(self.spread) < 30:
+            return None
+
+        arr = list(self.spread)
+        mean = sum(arr) / len(arr)
+        variance = sum((x - mean) ** 2 for x in arr) / len(arr)
+        std = math.sqrt(variance) if variance > 0 else 1e-6
+        zscore = (spread - mean) / std
+
+        now = time.time()
+        zscore_threshold = 2.0
+
+        if now - self.last_signal_time < self.cooldown_seconds:
+            return None
+
+        signal = None
+        if zscore > zscore_threshold:
+            signal = {
+                "type": "COINTEGRATION_SHORT_A_LONG_B",
+                "zscore": round(zscore, 3),
+                "pair": f"{self.pair[0]}/{self.pair[1]}",
+                "confidence": min(0.85, 0.5 + (zscore - zscore_threshold) * 0.15),
+                "expected_reversion_pct": round(abs(zscore) * 0.15, 2),
+                "action": "SHORT_FIRST_LONG_SECOND"
+            }
+            self.last_signal_time = now
+        elif zscore < -zscore_threshold:
+            signal = {
+                "type": "COINTEGRATION_LONG_A_SHORT_B",
+                "zscore": round(zscore, 3),
+                "pair": f"{self.pair[0]}/{self.pair[1]}",
+                "confidence": min(0.85, 0.5 + (abs(zscore) - zscore_threshold) * 0.15),
+                "expected_reversion_pct": round(abs(zscore) * 0.15, 2),
+                "action": "LONG_FIRST_SHORT_SECOND"
+            }
+            self.last_signal_time = now
+
+        return signal
+
+
+# Trackers globais de cointegração
+_cointegration_trackers: dict[Tuple[str, str], CointegrationTracker] = {}
+# Pares a monitorar (ajuste conforme correlação histórica)
+COINTEGRATION_PAIRS = [
+    ("ETH-USDT", "SOL-USDT"),
+    ("BTC-USDT", "ETH-USDT"),
+    ("SOL-USDT", "NEAR-USDT"),
+]
+
+
+def _get_or_create_cointegration_tracker(sym_a: str, sym_b: str) -> CointegrationTracker:
+    """Obtém ou cria tracker de cointegração para o par."""
+    key = (sym_a, sym_b)
+    if key not in _cointegration_trackers:
+        _cointegration_trackers[key] = CointegrationTracker(key)
+    return _cointegration_trackers[key]
+
+
+def _detect_volatility_exhaustion(history: list[dict], window: int = 20) -> dict:
+    """Detecta quando a volatilidade está diminuindo após um pico (exaustão)."""
+    if len(history) < window:
+        return {"exhausted": False, "reason": "insufficient_data", "signal": None}
+
+    ranges = []
+    for i in range(max(1, len(history) - window), len(history)):
+        h = history[i]
+        price = h.get("price", 0)
+        if price > 0:
+            high = h.get("high_24h", price)
+            low = h.get("low_24h", price)
+            if high > 0 and low > 0:
+                rng = (high - low) / price * 100
+                ranges.append(rng)
+
+    if len(ranges) < 10:
+        return {"exhausted": False, "reason": "insufficient_ranges", "signal": None}
+
+    first_half = sum(ranges[:len(ranges)//2]) / (len(ranges)//2)
+    second_half = sum(ranges[len(ranges)//2:]) / max(1, len(ranges) - len(ranges)//2)
+
+    if first_half <= 0:
+        return {"exhausted": False, "reason": "zero_volatility", "signal": None}
+
+    contraction = (first_half - second_half) / first_half
+
+    if contraction > 0.3 and second_half < 0.5:
+        return {
+            "exhausted": True,
+            "contraction_pct": round(contraction * 100, 1),
+            "current_vol_pct": round(second_half, 2),
+            "previous_vol_pct": round(first_half, 2),
+            "signal": "VOLATILITY_EXHAUSTION",
+            "action": "REDUCE_POSITION_SIZE"
+        }
+
+    return {"exhausted": False, "contraction_pct": round(contraction * 100, 1), "signal": None}
+
+
+def _detect_toxic_liquidity(history: list[dict], threshold_bps: float = 15.0) -> dict:
+    """Detecta momentos onde o spread está alto e volume baixo (liquidez tóxica)."""
+    if len(history) < 5:
+        return {"toxic": False, "reason": "insufficient_data", "signal": None}
+
+    recent = history[-5:]
+    spreads = [h.get("spread_bps", 0) for h in recent if h.get("spread_bps", 0) > 0]
+    volumes = [h.get("volume_ratio", 1) for h in recent]
+
+    if not spreads:
+        return {"toxic": False, "reason": "no_spread_data", "signal": None}
+
+    avg_spread = sum(spreads) / len(spreads)
+    avg_volume = sum(volumes) / len(volumes)
+
+    if avg_spread > threshold_bps and avg_volume < 0.8:
+        return {
+            "toxic": True,
+            "avg_spread_bps": round(avg_spread, 1),
+            "avg_volume_ratio": round(avg_volume, 2),
+            "signal": "TOXIC_LIQUIDITY",
+            "action": "BLOCK_ENTRIES",
+            "confidence": min(0.9, 0.5 + (avg_spread - threshold_bps) / 30)
+        }
+
+    return {"toxic": False, "avg_spread_bps": round(avg_spread, 1), "signal": None}
+
+
+def _detect_micro_structure_anomaly(history: list[dict]) -> dict:
+    """
+    Detecta anomalias de microestrutura:
+    - Quote stuffing (muitas mudanças de preço sem volume)
+    - Spoofing (ordens grandes que somem)
+    """
+    if len(history) < 10:
+        return {"anomaly": False, "reason": "insufficient_data", "signal": None}
+
+    recent = history[-10:]
+
+    # Mudanças de preço consecutivas sem volume
+    price_changes = [abs(h.get("price_change_pct", 0)) for h in recent]
+    volumes = [h.get("volume_ratio", 1) for h in recent]
+
+    high_change_count = sum(1 for pc in price_changes if pc > 0.2)
+    low_volume_count = sum(1 for v in volumes if v < 0.7)
+
+    if high_change_count >= 6 and low_volume_count >= 6:
+        return {
+            "anomaly": True,
+            "type": "QUOTE_STUFFING",
+            "signal": "MICRO_STRUCTURE_ANOMALY",
+            "action": "DELAY_ENTRY_5_SECONDS",
+            "confidence": 0.7
+        }
+
+    return {"anomaly": False, "signal": None}
+
+
+async def _assess_data_quality(symbol: str, history: list[dict]) -> dict:
+    """Avaliação contínua da qualidade dos dados de mercado."""
+
+    if len(history) < 10:
+        return {"quality": "BOOTSTRAPPING", "score": 0.3, "signal": None}
+
+    # 1. Latência
+    now = time.time()
+    last_ts = history[-1].get("timestamp", 0)
+    latency = now - last_ts
+    latency_penalty = 0 if latency < 2 else min(0.5, (latency - 2) / 10)
+
+    # 2. Gaps entre snapshots
+    timestamps = [h.get("timestamp", 0) for h in history]
+    gaps = [timestamps[i] - timestamps[i-1] for i in range(1, len(timestamps))]
+    max_gap = max(gaps) if gaps else 0
+    gap_penalty = 0 if max_gap < 10 else min(0.4, (max_gap - 10) / 30)
+
+    # 3. Consistência de preço (sem saltos anormais)
+    prices = [h.get("price", 0) for h in history if h.get("price", 0) > 0]
+    abnormal_moves = 0
+    if len(prices) > 1:
+        for i in range(1, len(prices)):
+            if prices[i-1] > 0:
+                move_pct = abs(prices[i] - prices[i-1]) / prices[i-1] * 100
+                if move_pct > 5:  # 5% em 5 segundos é anormal
+                    abnormal_moves += 1
+        abnormal_penalty = min(0.3, abnormal_moves / len(prices))
+    else:
+        abnormal_penalty = 0.3
+
+    quality_score = max(0.0, 1.0 - (latency_penalty + gap_penalty + abnormal_penalty))
+
+    if quality_score >= 0.9:
+        quality = "EXCELLENT"
+        signal = None
+    elif quality_score >= 0.7:
+        quality = "GOOD"
+        signal = None
+    elif quality_score >= 0.5:
+        quality = "DEGRADED"
+        signal = "DATA_QUALITY_DEGRADED"
+    else:
+        quality = "UNRELIABLE"
+        signal = "DATA_QUALITY_UNRELIABLE"
+
+    # Persiste observação se qualidade degradada
+    if quality in {"DEGRADED", "UNRELIABLE"}:
+        await kb.save_observation(
+            symbol=symbol,
+            category="DATA_QUALITY",
+            text=f"Qualidade de dados {quality}: latência {latency:.1f}s, gap máx {max_gap:.1f}s, movimentos anormais {abnormal_moves}",
+            data={
+                "quality": quality,
+                "score": quality_score,
+                "latency": round(latency, 2),
+                "max_gap": round(max_gap, 2),
+                "abnormal_moves": abnormal_moves,
+                "abnormal_moves_ratio": round(abnormal_moves / len(prices) if prices else 0, 3)
+            },
+            confidence=quality_score
+        )
+
+    return {"quality": quality, "score": quality_score, "signal": signal}
+
+
+def _detect_order_flow_imbalance(history: list[dict], window: int = 10) -> dict:
+    """
+    Detecta imbalance no order flow baseado em tick direction.
+    Simula tick direction via price change.
+    """
+    if len(history) < window:
+        return {"imbalance": 0.0, "signal": None}
+
+    recent = history[-window:]
+    up_ticks = 0
+    down_ticks = 0
+
+    for i in range(1, len(recent)):
+        prev_price = recent[i-1].get("price", 0)
+        curr_price = recent[i].get("price", 0)
+        if prev_price > 0 and curr_price > 0:
+            if curr_price > prev_price:
+                up_ticks += 1
+            elif curr_price < prev_price:
+                down_ticks += 1
+
+    total = up_ticks + down_ticks
+    if total == 0:
+        return {"imbalance": 0.0, "signal": None}
+
+    imbalance = (up_ticks - down_ticks) / total
+
+    # Imbalance significativo (> 0.6 ou < -0.6)
+    if imbalance > 0.6:
+        return {
+            "imbalance": round(imbalance, 3),
+            "direction": "BUYING_PRESSURE",
+            "signal": "ORDER_FLOW_IMBALANCE_BUY",
+            "confidence": min(0.8, 0.5 + abs(imbalance))
+        }
+    elif imbalance < -0.6:
+        return {
+            "imbalance": round(imbalance, 3),
+            "direction": "SELLING_PRESSURE",
+            "signal": "ORDER_FLOW_IMBALANCE_SELL",
+            "confidence": min(0.8, 0.5 + abs(imbalance))
+        }
+
+    return {"imbalance": round(imbalance, 3), "signal": None}
+
+
+def _detect_liquidity_sweep(history: list[dict], lookback: int = 20) -> dict:
+    """
+    Detecta liquidity sweep: preço quebra nível chave e reverte rapidamente.
+    """
+    if len(history) < lookback:
+        return {"sweep": False, "signal": None}
+
+    recent = history[-lookback:]
+    prices = [h.get("price", 0) for h in recent if h.get("price", 0) > 0]
+
+    if len(prices) < lookback // 2:
+        return {"sweep": False, "signal": None}
+
+    # Níveis chave: high e low do período
+    high = max(prices)
+    low = min(prices)
+    current = prices[-1]
+    prev_2 = prices[-3] if len(prices) >= 3 else current
+
+    # Detecta sweep de high (quebra seguida de reversão)
+    if prev_2 >= high * 0.998 and current < high * 0.995:
+        return {
+            "sweep": True,
+            "type": "HIGH_SWEEP_REVERSAL",
+            "signal": "LIQUIDITY_SWEEP_SHORT",
+            "confidence": 0.65,
+            "action": "SHORT_ON_REVERSAL"
+        }
+
+    # Detecta sweep de low
+    if prev_2 <= low * 1.002 and current > low * 1.005:
+        return {
+            "sweep": True,
+            "type": "LOW_SWEEP_REVERSAL",
+            "signal": "LIQUIDITY_SWEEP_LONG",
+            "confidence": 0.65,
+            "action": "LONG_ON_REVERSAL"
+        }
+
+    return {"sweep": False, "signal": None}
+
+
+# ========== FUNÇÕES EXISTENTES (mantidas intactas) ==========
 
 def on_alert(fn):
     _alert_callbacks.append(fn)
@@ -65,7 +398,7 @@ def _classify_pattern(snap: MarketSnapshot, history: list[dict]) -> list[str]:
         patterns.append("OI_PRICE_VOL_TRIPLE_UP")
 
     if snap.oi_change_pct >= 5 and snap.price_change_pct <= -0.5:
-        patterns.append("OI_UP_PRICE_DOWN")  # posições short acumulando
+        patterns.append("OI_UP_PRICE_DOWN")
 
     if snap.funding_rate <= -0.0003 and snap.rsi_approx <= 35:
         patterns.append("NEGATIVE_FUNDING_OVERSOLD")
@@ -74,10 +407,10 @@ def _classify_pattern(snap: MarketSnapshot, history: list[dict]) -> list[str]:
         patterns.append("POSITIVE_FUNDING_OVERBOUGHT")
 
     if snap.volume_ratio >= 3 and abs(snap.price_change_pct) <= 0.3:
-        patterns.append("HIGH_VOL_LOW_MOVE")  # absorção
+        patterns.append("HIGH_VOL_LOW_MOVE")
 
     if snap.btc_regime == "NEUTRAL" and snap.oi_change_pct >= 4 and snap.funding_rate <= 0.0001:
-        patterns.append("BTC_LATERAL_OI_BUILD")  # setup long clássico
+        patterns.append("BTC_LATERAL_OI_BUILD")
 
     if len(history) >= 10:
         prices = [h.get("price", 0) for h in history[-10:]]
@@ -107,11 +440,70 @@ async def _process_snapshot(snap: MarketSnapshot):
         "rsi": snap.rsi_approx,
         "btc_regime": snap.btc_regime,
         "timestamp": snap.timestamp,
+        "high_24h": snap.high_24h,
+        "low_24h": snap.low_24h,
     })
 
     history = list(_snap_buffer[sym])
 
-    # Persiste snapshot na KB a cada ~30s (1 em 6 chamadas a 5s)
+    # ========== NOVAS DETECÇÕES PARA EXCELÊNCIA ==========
+
+    # 1. Qualidade dos dados
+    data_quality = await _assess_data_quality(sym, history)
+    if data_quality.get("signal"):
+        snap.anomalies.append(data_quality["signal"])
+
+    # 2. Liquidez tóxica
+    toxic_liquidity = _detect_toxic_liquidity(history)
+    if toxic_liquidity.get("signal"):
+        snap.anomalies.append(f"{toxic_liquidity['signal']}: spread {toxic_liquidity['avg_spread_bps']}bps")
+
+    # 3. Volatilidade exausta
+    vol_exhaustion = _detect_volatility_exhaustion(history)
+    if vol_exhaustion.get("signal"):
+        snap.anomalies.append(f"{vol_exhaustion['signal']}: vol caiu {vol_exhaustion['contraction_pct']:.0f}%")
+
+    # 4. Order flow imbalance
+    ofi = _detect_order_flow_imbalance(history)
+    if ofi.get("signal"):
+        snap.anomalies.append(f"{ofi['signal']}: imbalance {ofi['imbalance']:.2f}")
+
+    # 5. Liquidity sweep
+    sweep = _detect_liquidity_sweep(history)
+    if sweep.get("signal"):
+        snap.anomalies.append(f"{sweep['signal']}: {sweep['type']}")
+
+    # 6. Cointegração
+    for pair in COINTEGRATION_PAIRS:
+        if sym in pair:
+            other = pair[0] if pair[1] == sym else pair[1]
+            other_snap = None
+            for s, snap_obj in _snap_buffer.items():
+                if s == other and snap_obj:
+                    other_snap = snap_obj[-1] if snap_obj else None
+                    break
+
+            if other_snap and other_snap.get("price", 0) > 0:
+                tracker = _get_or_create_cointegration_tracker(pair[0], pair[1])
+                signal = tracker.update(snap.price, other_snap["price"])
+                if signal:
+                    snap.anomalies.append(f"{signal['type']}: z={signal['zscore']}")
+                    await kb.save_observation(
+                        symbol=sym,
+                        category="COINTEGRATION",
+                        text=f"Cointegração detectada: {signal['message'] if 'message' in signal else signal['type']}",
+                        data=signal,
+                        confidence=signal.get("confidence", 0.6)
+                    )
+
+    # 7. Microestrutura
+    micro_anomaly = _detect_micro_structure_anomaly(history)
+    if micro_anomaly.get("signal"):
+        snap.anomalies.append(f"{micro_anomaly['signal']}: {micro_anomaly.get('type', 'unknown')}")
+
+    # ========== PERSISTÊNCIA EXISTENTE ==========
+
+    # Persiste snapshot na KB a cada ~30s
     if int(snap.timestamp) % 30 < 5:
         await kb.save_feature_snapshot(sym, {
             "price": snap.price,

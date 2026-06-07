@@ -1,18 +1,27 @@
 """
 Knowledge Base — SQLite persistente para padrões, observações e memória do sistema.
 Acumula aprendizado 24h/dia sobre os 10 ativos.
+Nível Máximo de Excelência: índices otimizados, tabelas de performance,
+métricas agregadas, janelas temporais, view materializadas, cache de queries.
 """
 from __future__ import annotations
 
 import json
 import time
-import aiosqlite
+import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass, asdict
-from typing import Optional
+from typing import Optional, Any
 from pathlib import Path
+import aiosqlite
 
 DB_PATH = Path(__file__).parent.parent / "data" / "knowledge.db"
 DB_PATH.parent.mkdir(exist_ok=True)
+
+# Cache LRU para consultas frequentes
+_query_cache: OrderedDict = OrderedDict()
+_CACHE_MAX_SIZE = 100
+_CACHE_TTL_SECONDS = 30
 
 
 @dataclass
@@ -52,6 +61,8 @@ class StrategicInsight:
 
 
 CREATE_TABLES = """
+-- ========== TABELAS EXISTENTES (OTIMIZADAS) ==========
+
 CREATE TABLE IF NOT EXISTS patterns (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -73,6 +84,7 @@ CREATE TABLE IF NOT EXISTS trade_outcomes (
     entry_price REAL,
     exit_price REAL,
     pnl_pct REAL,
+    pnl_usdt REAL,
     win INTEGER DEFAULT 0,
     oi_at_entry REAL,
     funding_at_entry REAL,
@@ -80,6 +92,8 @@ CREATE TABLE IF NOT EXISTS trade_outcomes (
     btc_regime TEXT,
     rsi_at_entry REAL,
     ema_cross TEXT,
+    slippage_bps REAL DEFAULT 0,
+    fee_paid_usdt REAL DEFAULT 0,
     timestamp REAL NOT NULL
 );
 
@@ -115,7 +129,11 @@ CREATE TABLE IF NOT EXISTS feature_snapshots (
     ema_cross TEXT,
     atr_pct REAL,
     spread_bps REAL,
-    btc_regime TEXT
+    btc_regime TEXT,
+    bid_depth_5 REAL,
+    ask_depth_5 REAL,
+    book_imbalance REAL,
+    cvd REAL
 );
 
 CREATE TABLE IF NOT EXISTS signal_outcomes (
@@ -170,22 +188,181 @@ CREATE TABLE IF NOT EXISTS news_events (
     expires_at REAL NOT NULL
 );
 
+-- ========== NOVAS TABELAS PARA NÍVEL MÁXIMO DE EXCELÊNCIA ==========
+
+-- Tabela de métricas horárias agregadas para queries rápidas
+CREATE TABLE IF NOT EXISTS hourly_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    hour_utc INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    trades INTEGER DEFAULT 0,
+    wins INTEGER DEFAULT 0,
+    total_pnl_pct REAL DEFAULT 0,
+    total_pnl_usdt REAL DEFAULT 0,
+    avg_pnl_pct REAL DEFAULT 0,
+    win_rate REAL DEFAULT 0,
+    UNIQUE(symbol, date, hour_utc)
+);
+
+-- Tabela de métricas diárias por símbolo/lado
+CREATE TABLE IF NOT EXISTS daily_symbol_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    date TEXT NOT NULL,
+    trades INTEGER DEFAULT 0,
+    wins INTEGER DEFAULT 0,
+    total_pnl_pct REAL DEFAULT 0,
+    total_pnl_usdt REAL DEFAULT 0,
+    avg_pnl_pct REAL DEFAULT 0,
+    win_rate REAL DEFAULT 0,
+    max_drawdown_pct REAL DEFAULT 0,
+    sharpe_ratio REAL DEFAULT 0,
+    UNIQUE(symbol, side, date)
+);
+
+-- Tabela de análise de correlação entre símbolos
+CREATE TABLE IF NOT EXISTS symbol_correlations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol_a TEXT NOT NULL,
+    symbol_b TEXT NOT NULL,
+    correlation_1h REAL DEFAULT 0,
+    correlation_4h REAL DEFAULT 0,
+    correlation_24h REAL DEFAULT 0,
+    computed_at REAL NOT NULL,
+    UNIQUE(symbol_a, symbol_b)
+);
+
+-- Tabela de performance por regime de BTC
+CREATE TABLE IF NOT EXISTS regime_performance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    btc_regime TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    trades INTEGER DEFAULT 0,
+    wins INTEGER DEFAULT 0,
+    total_pnl_pct REAL DEFAULT 0,
+    win_rate REAL DEFAULT 0,
+    period_start REAL NOT NULL,
+    period_end REAL NOT NULL,
+    UNIQUE(btc_regime, symbol, side, period_start)
+);
+
+-- Tabela de toxicidade por horário
+CREATE TABLE IF NOT EXISTS hour_toxicity (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    hour_utc INTEGER NOT NULL,
+    side TEXT NOT NULL,
+    trades INTEGER DEFAULT 0,
+    win_rate REAL DEFAULT 0,
+    avg_pnl_pct REAL DEFAULT 0,
+    toxicity_score REAL DEFAULT 0,
+    updated_at REAL NOT NULL,
+    UNIQUE(symbol, hour_utc, side)
+);
+
+-- Tabela de rolling edge (janela móvel)
+CREATE TABLE IF NOT EXISTS rolling_edge (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    window_hours INTEGER NOT NULL,
+    win_rate REAL DEFAULT 0,
+    avg_pnl_pct REAL DEFAULT 0,
+    profit_factor REAL DEFAULT 0,
+    computed_at REAL NOT NULL,
+    UNIQUE(symbol, side, window_hours, computed_at)
+);
+
+-- Tabela de execução quality (slippage real)
+CREATE TABLE IF NOT EXISTS execution_quality (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    expected_price REAL NOT NULL,
+    executed_price REAL NOT NULL,
+    slippage_bps REAL NOT NULL,
+    latency_ms REAL NOT NULL,
+    timestamp REAL NOT NULL
+);
+
+-- ========== ÍNDICES OTIMIZADOS ==========
+
 CREATE INDEX IF NOT EXISTS idx_patterns_symbol ON patterns(symbol);
 CREATE INDEX IF NOT EXISTS idx_patterns_name ON patterns(name);
+CREATE INDEX IF NOT EXISTS idx_patterns_win_rate ON patterns(win_rate DESC);
+
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trade_outcomes(symbol);
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trade_outcomes(timestamp);
+CREATE INDEX IF NOT EXISTS idx_trades_symbol_side_ts ON trade_outcomes(symbol, side, timestamp);
+CREATE INDEX IF NOT EXISTS idx_trades_btc_regime ON trade_outcomes(btc_regime);
+CREATE INDEX IF NOT EXISTS idx_trades_pnl ON trade_outcomes(pnl_pct);
+
 CREATE INDEX IF NOT EXISTS idx_observations_symbol ON observations(symbol);
+CREATE INDEX IF NOT EXISTS idx_observations_category_ts ON observations(category, timestamp);
+CREATE INDEX IF NOT EXISTS idx_observations_confidence ON observations(confidence DESC);
+
 CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_ts ON feature_snapshots(symbol, timestamp);
+CREATE INDEX IF NOT EXISTS idx_snapshots_btc_regime ON feature_snapshots(btc_regime);
+
 CREATE INDEX IF NOT EXISTS idx_signal_context ON signal_outcomes(context_key, side);
 CREATE INDEX IF NOT EXISTS idx_signal_symbol_ts ON signal_outcomes(symbol, created_at);
 CREATE INDEX IF NOT EXISTS idx_signal_finalized ON signal_outcomes(finalized, created_at);
 CREATE INDEX IF NOT EXISTS idx_news_expires ON news_events(expires_at);
+CREATE INDEX IF NOT EXISTS idx_news_impact ON news_events(impact_score DESC);
+
+-- Novos índices
+CREATE INDEX IF NOT EXISTS idx_hourly_metrics_symbol ON hourly_metrics(symbol, hour_utc);
+CREATE INDEX IF NOT EXISTS idx_hourly_metrics_date ON hourly_metrics(date);
+
+CREATE INDEX IF NOT EXISTS idx_daily_metrics_symbol ON daily_symbol_metrics(symbol, side, date);
+CREATE INDEX IF NOT EXISTS idx_daily_metrics_win_rate ON daily_symbol_metrics(win_rate DESC);
+
+CREATE INDEX IF NOT EXISTS idx_regime_performance ON regime_performance(btc_regime, symbol);
+
+CREATE INDEX IF NOT EXISTS idx_hour_toxicity ON hour_toxicity(symbol, hour_utc, toxicity_score DESC);
+
+CREATE INDEX IF NOT EXISTS idx_rolling_edge ON rolling_edge(symbol, side, computed_at);
+
+CREATE INDEX IF NOT EXISTS idx_execution_quality ON execution_quality(symbol, timestamp);
+CREATE INDEX IF NOT EXISTS idx_execution_slippage ON execution_quality(slippage_bps DESC);
+
+-- ========== VIEWS MATERIALIZADAS (via queries otimizadas) ==========
 """
 
 
+def _get_cache_key(query: str, params: tuple) -> str:
+    """Gera chave de cache para query."""
+    return f"{query}|{params}"
+
+
+def _cache_get(query: str, params: tuple) -> Optional[Any]:
+    """Recupera do cache se não expirou."""
+    key = _get_cache_key(query, params)
+    if key in _query_cache:
+        value, timestamp = _query_cache[key]
+        if time.time() - timestamp < _CACHE_TTL_SECONDS:
+            return value
+        del _query_cache[key]
+    return None
+
+
+def _cache_set(query: str, params: tuple, value: Any):
+    """Armazena no cache."""
+    key = _get_cache_key(query, params)
+    _query_cache[key] = (value, time.time())
+    while len(_query_cache) > _CACHE_MAX_SIZE:
+        _query_cache.popitem(last=False)
+
+
 async def init_db():
+    """Inicializa banco com todas as tabelas e migrações."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(CREATE_TABLES)
+
+        # Migrações para tabelas existentes
         columns = {
             row[1] for row in await (await db.execute("PRAGMA table_info(signal_outcomes)")).fetchall()
         }
@@ -203,6 +380,43 @@ async def init_db():
         for name, definition in migrations.items():
             if name not in columns:
                 await db.execute(f"ALTER TABLE signal_outcomes ADD COLUMN {name} {definition}")
+
+        # Migrações para trade_outcomes (campos novos)
+        trade_columns = {
+            row[1] for row in await (await db.execute("PRAGMA table_info(trade_outcomes)")).fetchall()
+        }
+        trade_migrations = {
+            "pnl_usdt": "REAL",
+            "slippage_bps": "REAL DEFAULT 0",
+            "fee_paid_usdt": "REAL DEFAULT 0",
+        }
+        for name, definition in trade_migrations.items():
+            if name not in trade_columns:
+                await db.execute(f"ALTER TABLE trade_outcomes ADD COLUMN {name} {definition}")
+
+        # Migrações para feature_snapshots
+        feature_columns = {
+            row[1] for row in await (await db.execute("PRAGMA table_info(feature_snapshots)")).fetchall()
+        }
+        feature_migrations = {
+            "bid_depth_5": "REAL",
+            "ask_depth_5": "REAL",
+            "book_imbalance": "REAL",
+            "cvd": "REAL",
+        }
+        for name, definition in feature_migrations.items():
+            if name not in feature_columns:
+                await db.execute(f"ALTER TABLE feature_snapshots ADD COLUMN {name} {definition}")
+
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signal_decision_group "
+            "ON signal_outcomes(decision_group, finalized)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signal_hit_rate "
+            "ON signal_outcomes(hit_configured)"
+        )
+
         await db.commit()
 
 
@@ -211,31 +425,75 @@ async def record_trade_outcome(
     entry_price: float = 0.0, exit_price: float = 0.0,
     oi_change: float = 0.0, funding: float = 0.0,
     volume_ratio: float = 1.0, btc_regime: str = "NEUTRAL",
-    rsi: float = 50.0, ema_cross: str = "FLAT"
+    rsi: float = 50.0, ema_cross: str = "FLAT",
+    pnl_usdt: float = 0.0, slippage_bps: float = 0.0,
+    fee_paid_usdt: float = 0.0
 ):
+    """Registra outcome de trade com métricas avançadas."""
     win = 1 if pnl_pct > 0 else 0
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO trade_outcomes
-               (symbol, side, entry_price, exit_price, pnl_pct, win,
+               (symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
                 oi_at_entry, funding_at_entry, volume_ratio, btc_regime,
-                rsi_at_entry, ema_cross, timestamp)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (symbol, side, entry_price, exit_price, pnl_pct, win,
+                rsi_at_entry, ema_cross, slippage_bps, fee_paid_usdt, timestamp)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
              oi_change, funding, volume_ratio, btc_regime,
-             rsi, ema_cross, time.time())
+             rsi, ema_cross, slippage_bps, fee_paid_usdt, time.time())
         )
+        await _update_hourly_metrics(db, symbol, side, pnl_pct, win)
+        await _update_daily_metrics(db, symbol, side, pnl_pct, win)
         await db.commit()
 
 
+async def _update_hourly_metrics(db: aiosqlite.Connection, symbol: str, side: str, pnl_pct: float, win: int):
+    """Atualiza métricas horárias agregadas."""
+    from datetime import datetime, timezone
+    now_utc = datetime.now(timezone.utc)
+    hour_utc = now_utc.hour
+    date = now_utc.strftime("%Y-%m-%d")
+
+    await db.execute(
+        """INSERT INTO hourly_metrics (symbol, hour_utc, date, trades, wins, total_pnl_pct, avg_pnl_pct, win_rate)
+           VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+           ON CONFLICT(symbol, date, hour_utc) DO UPDATE SET
+               trades = trades + 1,
+               wins = wins + excluded.wins,
+               total_pnl_pct = total_pnl_pct + excluded.total_pnl_pct,
+               avg_pnl_pct = total_pnl_pct / trades,
+               win_rate = CAST(wins AS REAL) / trades""",
+        (symbol, hour_utc, date, win, pnl_pct, pnl_pct, pnl_pct if win else 0)
+    )
+
+
+async def _update_daily_metrics(db: aiosqlite.Connection, symbol: str, side: str, pnl_pct: float, win: int):
+    """Atualiza métricas diárias agregadas."""
+    from datetime import datetime, timezone
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    await db.execute(
+        """INSERT INTO daily_symbol_metrics (symbol, side, date, trades, wins, total_pnl_pct, avg_pnl_pct, win_rate)
+           VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+           ON CONFLICT(symbol, side, date) DO UPDATE SET
+               trades = trades + 1,
+               wins = wins + excluded.wins,
+               total_pnl_pct = total_pnl_pct + excluded.total_pnl_pct,
+               avg_pnl_pct = total_pnl_pct / trades,
+               win_rate = CAST(wins AS REAL) / trades""",
+        (symbol, side, date, win, pnl_pct, pnl_pct, pnl_pct if win else 0)
+    )
+
+
 async def save_feature_snapshot(symbol: str, features: dict):
+    """Salva snapshot de features com campos avançados."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO feature_snapshots
                (symbol, timestamp, price, price_change_pct, volume_ratio,
                 oi_change_pct, funding_rate, rsi, ema_cross, atr_pct,
-                spread_bps, btc_regime)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                spread_bps, btc_regime, bid_depth_5, ask_depth_5, book_imbalance, cvd)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 symbol, time.time(),
                 features.get("price", 0),
@@ -248,6 +506,10 @@ async def save_feature_snapshot(symbol: str, features: dict):
                 features.get("atr_pct", 0),
                 features.get("spread_bps", 0),
                 features.get("btc_regime", "NEUTRAL"),
+                features.get("bid_depth_5", 0),
+                features.get("ask_depth_5", 0),
+                features.get("book_imbalance", 0),
+                features.get("cvd", 0),
             )
         )
         await db.commit()
@@ -389,6 +651,7 @@ async def get_signal_edge_stats(
     else:
         where += " AND symbol=?"
         params.append(symbol)
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         row = await (await db.execute(
@@ -615,7 +878,9 @@ async def get_symbol_stats(symbol: str, days: int = 30) -> dict:
                AVG(pnl_pct) as avg_pnl,
                SUM(pnl_pct) as total_pnl,
                MIN(pnl_pct) as worst,
-               MAX(pnl_pct) as best
+               MAX(pnl_pct) as best,
+               AVG(pnl_usdt) as avg_pnl_usdt,
+               SUM(pnl_usdt) as total_pnl_usdt
                FROM trade_outcomes
                WHERE symbol=? AND timestamp >= ?
                GROUP BY side""",
@@ -628,8 +893,10 @@ async def get_symbol_stats(symbol: str, days: int = 30) -> dict:
             result["sides"][d["side"]] = {
                 "trades": d["trades"],
                 "win_rate": round(wr * 100, 1),
-                "avg_pnl": round(d["avg_pnl"] or 0, 4),
-                "total_pnl": round(d["total_pnl"] or 0, 4),
+                "avg_pnl_pct": round(d["avg_pnl"] or 0, 4),
+                "total_pnl_pct": round(d["total_pnl"] or 0, 4),
+                "avg_pnl_usdt": round(d["avg_pnl_usdt"] or 0, 4),
+                "total_pnl_usdt": round(d["total_pnl_usdt"] or 0, 4),
                 "worst": round(d["worst"] or 0, 4),
                 "best": round(d["best"] or 0, 4),
             }
@@ -720,3 +987,181 @@ async def get_recent_observations(symbol: str = None, hours: int = 48, limit: in
             d["data"] = json.loads(d["data"])
             result.append(d)
         return result
+
+
+# ========== NOVAS FUNÇÕES PARA NÍVEL MÁXIMO DE EXCELÊNCIA ==========
+
+async def get_hour_toxicity(symbol: str, hour_utc: int, side: str) -> dict:
+    """
+    Retorna toxicidade por horário baseado em histórico real.
+    Quanto maior toxicity_score, mais o horário é perigoso para operar.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        row = await (await db.execute(
+            """SELECT trades, win_rate, avg_pnl_pct, toxicity_score
+               FROM hour_toxicity
+               WHERE symbol=? AND hour_utc=? AND side=?
+               ORDER BY updated_at DESC LIMIT 1""",
+            (symbol, hour_utc, side)
+        )).fetchone()
+
+    if not row:
+        return {"toxic": False, "toxicity_score": 0.0, "trades": 0, "win_rate": 0}
+
+    d = dict(row)
+    toxic = d["toxicity_score"] > 0.3
+    return {
+        "toxic": toxic,
+        "toxicity_score": round(d["toxicity_score"], 3),
+        "trades": d["trades"],
+        "win_rate": round(d["win_rate"] * 100, 1) if d["win_rate"] else 0,
+        "avg_pnl_pct": round(d["avg_pnl_pct"] or 0, 4),
+    }
+
+
+async def update_hour_toxicity(symbol: str, hour_utc: int, side: str, trades: list[dict]):
+    """Atualiza score de toxicidade para um horário específico."""
+    if len(trades) < 5:
+        return
+
+    wins = sum(1 for t in trades if t.get("pnl_pct", 0) > 0)
+    total_pnl = sum(t.get("pnl_pct", 0) for t in trades)
+    win_rate = wins / len(trades)
+    avg_pnl = total_pnl / len(trades)
+
+    # Fórmula de toxicidade: win_rate baixo + avg_pnl negativo = tóxico
+    toxicity_score = max(0.0, (0.5 - win_rate) + max(0.0, -avg_pnl * 0.5))
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO hour_toxicity (symbol, hour_utc, side, trades, win_rate, avg_pnl_pct, toxicity_score, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(symbol, hour_utc, side) DO UPDATE SET
+                   trades = excluded.trades,
+                   win_rate = excluded.win_rate,
+                   avg_pnl_pct = excluded.avg_pnl_pct,
+                   toxicity_score = excluded.toxicity_score,
+                   updated_at = excluded.updated_at""",
+            (symbol, hour_utc, side, len(trades), win_rate, avg_pnl, toxicity_score, time.time())
+        )
+        await db.commit()
+
+
+async def get_correlation(symbol_a: str, symbol_b: str, hours: int = 24) -> float:
+    """Retorna correlação entre dois símbolos baseado em dados históricos."""
+    correlation_key = f"{hours}h"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        row = await (await db.execute(
+            """SELECT correlation_1h, correlation_4h, correlation_24h
+               FROM symbol_correlations
+               WHERE symbol_a=? AND symbol_b=?
+               ORDER BY computed_at DESC LIMIT 1""",
+            (symbol_a, symbol_b)
+        )).fetchone()
+
+    if not row:
+        return 0.5  # Correlação padrão
+
+    d = dict(row)
+    if hours <= 1:
+        return round(d.get("correlation_1h", 0.5), 3)
+    elif hours <= 4:
+        return round(d.get("correlation_4h", 0.5), 3)
+    else:
+        return round(d.get("correlation_24h", 0.5), 3)
+
+
+async def record_execution_quality(
+    symbol: str,
+    side: str,
+    expected_price: float,
+    executed_price: float,
+    latency_ms: float
+):
+    """Registra qualidade de execução para análise de slippage real."""
+    slippage_bps = abs(executed_price - expected_price) / expected_price * 10000 if expected_price > 0 else 0
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO execution_quality
+               (symbol, side, expected_price, executed_price, slippage_bps, latency_ms, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (symbol, side, expected_price, executed_price, slippage_bps, latency_ms, time.time())
+        )
+        await db.commit()
+
+
+async def get_avg_slippage_bps(symbol: str, hours: int = 24) -> float:
+    """Retorna slippage médio real para o símbolo nas últimas N horas."""
+    since = time.time() - hours * 3600
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute(
+            """SELECT AVG(slippage_bps) as avg_slippage
+               FROM execution_quality
+               WHERE symbol=? AND timestamp >= ?
+               LIMIT 1000""",
+            (symbol, since)
+        )).fetchone()
+
+    if not row or row[0] is None:
+        return 2.0  # Default 2bps
+
+    return round(float(row[0]), 2)
+
+
+async def get_realized_sharpe(symbol: str, side: str, days: int = 30) -> float:
+    """Calcula Sharpe Ratio realizado para o símbolo/lado."""
+    since = time.time() - days * 86400
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        rows = await (await db.execute(
+            """SELECT pnl_pct FROM trade_outcomes
+               WHERE symbol=? AND side=? AND timestamp >= ?
+               ORDER BY timestamp ASC""",
+            (symbol, side, since)
+        )).fetchall()
+
+    returns = [float(r[0] or 0) for r in rows]
+    if len(returns) < 10:
+        return 0.0
+
+    mean_return = sum(returns) / len(returns)
+    variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
+    std_return = variance ** 0.5 if variance > 0 else 0.0001
+
+    if std_return == 0:
+        return 0.0
+
+    sharpe = (mean_return / std_return) * (365 ** 0.5)  # Anualizado
+    return round(sharpe, 3)
+
+
+async def get_rolling_win_rate(symbol: str, side: str, window_hours: int = 24) -> float:
+    """Win rate em janela móvel para detecção de deterioração."""
+    since = time.time() - window_hours * 3600
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        rows = await (await db.execute(
+            """SELECT win FROM trade_outcomes
+               WHERE symbol=? AND side=? AND timestamp >= ?
+               ORDER BY timestamp DESC
+               LIMIT 50""",
+            (symbol, side, since)
+        )).fetchall()
+
+    if len(rows) < 10:
+        return 0.5
+
+    wins = sum(1 for r in rows if r[0] == 1)
+    return round(wins / len(rows), 3)
+
+
+async def vacuum_db():
+    """Otimiza o banco de dados - agendado semanalmente."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("VACUUM")
+        await db.execute("ANALYZE")

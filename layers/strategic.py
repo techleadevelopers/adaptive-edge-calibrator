@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Any
 
 from core import knowledge_base as kb
+from core.database import Row, connect
 
 log = logging.getLogger("strategic")
 
@@ -656,15 +657,14 @@ async def compute_edge_evolution(days: int = 30) -> list[EdgeEvolution]:
     Divide o período em duas metades e compara win rate / PnL médio.
     Detecta se o edge está melhorando ou deteriorando.
     """
-    import aiosqlite
     from core.knowledge_base import DB_PATH
 
     since = time.time() - days * 86400
     mid = since + (days * 86400) / 2
     evolutions = []
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
         for sym in SYMBOLS_SHORT:
             for side in ["LONG", "SHORT"]:
                 early = await (await db.execute(
@@ -725,15 +725,14 @@ async def _get_regime_performance(returns_by_symbol_regime: dict) -> dict:
 
 async def build_strategic_report(days: int = 30) -> StrategicReport:
     """Gera relatório completo: stats globais + evolução de edge por símbolo."""
-    import aiosqlite
     from core.knowledge_base import DB_PATH
 
     since = time.time() - days * 86400
     all_stats = await kb.get_all_symbols_stats(days)
     evolutions = await compute_edge_evolution(days)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
         totals = await (await db.execute(
             """SELECT COUNT(*) as n, SUM(win) as w, AVG(pnl_pct) as ap
                FROM trade_outcomes WHERE timestamp >= ?""",

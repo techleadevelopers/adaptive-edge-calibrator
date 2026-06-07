@@ -52,7 +52,8 @@ _runtime_state = {
 }
 _DB_INIT_TIMEOUT_SECONDS = float(os.environ.get("DB_INIT_TIMEOUT_SECONDS", "20"))
 _DB_INIT_RETRY_SECONDS = float(os.environ.get("DB_INIT_RETRY_SECONDS", "10"))
-_MODEL_MAINTENANCE_SECONDS = float(os.environ.get("MODEL_MAINTENANCE_SECONDS", "30"))
+_MODEL_MAINTENANCE_SECONDS = float(os.environ.get("MODEL_MAINTENANCE_SECONDS", "120"))
+_TACTICAL_LOOP_SECONDS = max(5, int(float(os.environ.get("TACTICAL_LOOP_SECONDS", "15"))))
 _RETENTION_MAINTENANCE_SECONDS = float(
     os.environ.get("RETENTION_MAINTENANCE_SECONDS", "3600")
 )
@@ -276,9 +277,9 @@ async def _initialize_runtime_services():
         log.exception("Knowledge Base initialization failed - continuing anyway")
 
     # 🔥 SEMPRE inicia os serviços, mesmo se o KB falhou
-    tactical_task = asyncio.create_task(run_tactical_loop(engine, interval_seconds=5))
+    tactical_task = asyncio.create_task(run_tactical_loop(engine, interval_seconds=_TACTICAL_LOOP_SECONDS))
     _tasks.append(tactical_task)
-    log.info("Tactical loop started (5s interval)")
+    log.info(f"Tactical loop started ({_TACTICAL_LOOP_SECONDS}s interval)")
 
     from layers.strategic import run_strategic_loop
     strategic_task = asyncio.create_task(run_strategic_loop(interval_hours=6))

@@ -74,6 +74,7 @@ def _feature_dict(row: dict[str, Any]) -> dict[str, Any]:
         "symbol": row.get("symbol", ""),
         "side": row.get("side", ""),
         "context_key": row.get("context_key", ""),
+        "decision_group": row.get("decision_group", "UNKNOWN"),
         "target_move_pct": float(row.get("target_configured_move_pct", 0) or 0),
         "estimated_cost_pct": float(row.get("estimated_cost_pct", 0) or 0),
     }
@@ -222,7 +223,7 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
     except ImportError as exc:
         return {"trained": False, "reason": f"ml_dependencies_missing: {exc}"}
 
-    rows = await kb.get_signal_training_rows()
+    rows = await kb.get_signal_training_rows(decision_group=None)
     if len(rows) < min_samples:
         return {
             "trained": False,
@@ -358,8 +359,28 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
         joblib.dump(final_model, MODEL_PATH)
         METADATA_PATH.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        await kb.save_model_artifact(
+            "sniper_target_050",
+            MODEL_PATH.read_bytes(),
+            metadata,
+        )
 
     return {"trained": improves_baseline, **metadata}
+
+
+async def restore_shadow_model() -> bool:
+    if MODEL_PATH.exists() and METADATA_PATH.exists():
+        return True
+    artifact = await kb.get_model_artifact("sniper_target_050")
+    if not artifact:
+        return False
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    MODEL_PATH.write_bytes(artifact["content"])
+    METADATA_PATH.write_text(
+        json.dumps(artifact["metadata"], indent=2),
+        encoding="utf-8",
+    )
+    return True
 
 
 def shadow_model_status() -> dict[str, Any]:
@@ -467,7 +488,7 @@ async def evaluate_model_performance() -> dict[str, Any]:
     if not MODEL_PATH.exists():
         return {"success": False, "reason": "model_not_found"}
 
-    rows = await kb.get_signal_training_rows()
+    rows = await kb.get_signal_training_rows(decision_group=None)
     if len(rows) < 100:
         return {"success": False, "reason": "insufficient_samples"}
 

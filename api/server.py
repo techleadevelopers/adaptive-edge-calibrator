@@ -802,7 +802,28 @@ async def evaluate_edge_endpoint(body: dict):
     """Authoritative edge gate: backend sends pending entry context, Quant Brain returns allow/reject."""
     if "symbol" not in body:
         raise HTTPException(400, "Required field: symbol")
-    return await evaluate_edge_gate(body)
+    try:
+        return await asyncio.wait_for(evaluate_edge_gate(body), timeout=25)
+    except asyncio.TimeoutError:
+        log.exception("edge evaluate timeout")
+        return {
+            "allow": True,
+            "gateRejects": [],
+            "score": 0.0,
+            "authority": "quant-brain-degraded",
+            "mode": "degraded_timeout",
+            "error": "edge_evaluate_timeout",
+        }
+    except Exception as exc:
+        log.exception("edge evaluate failed")
+        return {
+            "allow": True,
+            "gateRejects": [],
+            "score": 0.0,
+            "authority": "quant-brain-degraded",
+            "mode": "degraded_error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 # ========== SIGNALS ==========

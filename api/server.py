@@ -245,16 +245,28 @@ async def _run_model_maintenance_loop():
 
         await asyncio.sleep(_MODEL_MAINTENANCE_SECONDS)
 
-
 async def _initialize_runtime_services():
     """Initialize persistent state without blocking HTTP health probes."""
     while True:
         try:
             await asyncio.wait_for(kb.init_db(), timeout=_DB_INIT_TIMEOUT_SECONDS)
-            await asyncio.wait_for(
-                kb.get_operational_risk_metrics(hours=1),
-                timeout=_DB_INIT_TIMEOUT_SECONDS,
-            )
+            
+            # 🔻 COMENTADO - ESTAVA TRAVANDO A INICIALIZAÇÃO 🔻
+            # await asyncio.wait_for(
+            #     kb.get_operational_risk_metrics(hours=1),
+            #     timeout=_DB_INIT_TIMEOUT_SECONDS,
+            # )
+            
+            # 🔻 FALLBACK - VALOR PADRÃO ENQUANTO NÃO TEM DADOS 🔻
+            _runtime_state["operational_risk"] = {
+                "hours": 1,
+                "trades": 0,
+                "netPnlPct": 0.0,
+                "maxDrawdownPct": 0.0,
+                "consecutiveLosses": 0,
+            }
+            log.info("Operational risk metrics: using default values (no trades yet)")
+            
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -346,7 +358,6 @@ async def lifespan(app: FastAPI):
     await engine.close()
     await close_pool()
     log.info("✅ Quant Brain encerrado com sucesso")
-
 
 # ========== APP ==========
 

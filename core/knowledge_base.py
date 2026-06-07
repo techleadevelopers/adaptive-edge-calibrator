@@ -709,11 +709,15 @@ async def get_signal_edge_stats(
 
 async def get_signal_training_rows(
     decision_group: str | None = None,
-    source_type: str = "hypothetical",
+    source_type: str | None = "hypothetical",
     limit: int = 50000,
 ) -> list[dict]:
     decision_filter = ""
-    params: list[Any] = [source_type]
+    source_filter = ""
+    params: list[Any] = []
+    if source_type:
+        source_filter = "AND source_type=?"
+        params.append(source_type)
     if decision_group:
         decision_filter = " AND decision_group=?"
         params.append(decision_group)
@@ -726,7 +730,8 @@ async def get_signal_training_rows(
                       target_configured_move_pct, estimated_cost_pct, hit_configured,
                       stopped, first_event, created_at
                FROM signal_outcomes
-               WHERE finalized=1 AND source_type=?
+               WHERE finalized=1
+                 {source_filter}
                  AND hit_configured IS NOT NULL
                  {decision_filter}
                ORDER BY created_at ASC
@@ -743,10 +748,14 @@ async def get_signal_training_rows(
 
 async def get_signal_training_summary(
     decision_group: str | None = None,
-    source_type: str = "hypothetical",
+    source_type: str | None = "hypothetical",
 ) -> dict:
     decision_filter = ""
-    params: list[Any] = [source_type]
+    source_filter = ""
+    params: list[Any] = []
+    if source_type:
+        source_filter = "AND source_type=?"
+        params.append(source_type)
     if decision_group:
         decision_filter = " AND decision_group=?"
         params.append(decision_group)
@@ -757,7 +766,8 @@ async def get_signal_training_summary(
                       SUM(CASE WHEN hit_configured=0 THEN 1 ELSE 0 END) AS misses,
                       MAX(created_at) AS latest_created_at
                FROM signal_outcomes
-               WHERE finalized=1 AND source_type=?
+               WHERE finalized=1
+                 {source_filter}
                  AND hit_configured IS NOT NULL
                  {decision_filter}""",
             params,
@@ -797,6 +807,56 @@ async def get_signal_pipeline_summary() -> dict:
         "waited": int(values[4] or 0),
         "blocked": int(values[5] or 0),
     }
+
+
+async def get_recent_signal_outcomes(limit: int = 20, source_type: str | None = None) -> list[dict]:
+    params: list[Any] = []
+    source_filter = ""
+    if source_type:
+        source_filter = "WHERE source_type=?"
+        params.append(source_type)
+    params.append(limit)
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
+        rows = await (await db.execute(
+            f"""SELECT signal_id, symbol, side, decision, decision_group, source_type,
+                      context_key, hit_configured, stopped, first_event,
+                      max_favorable_pct, max_adverse_pct, created_at, finalized
+               FROM signal_outcomes
+               {source_filter}
+               ORDER BY created_at DESC
+               LIMIT ?""",
+            params,
+        )).fetchall()
+    return [dict(row) for row in rows]
+
+
+async def get_signal_source_summary() -> list[dict]:
+    async with connect(DB_PATH) as db:
+        rows = await (await db.execute(
+            """SELECT source_type,
+                      COUNT(*) AS observed,
+                      SUM(CASE WHEN finalized=0 THEN 1 ELSE 0 END) AS pending,
+                      SUM(CASE WHEN finalized=1 THEN 1 ELSE 0 END) AS finalized,
+                      SUM(CASE WHEN hit_configured=1 THEN 1 ELSE 0 END) AS hits,
+                      SUM(CASE WHEN hit_configured=0 THEN 1 ELSE 0 END) AS misses,
+                      MAX(created_at) AS latest_created_at
+               FROM signal_outcomes
+               GROUP BY source_type
+               ORDER BY observed DESC"""
+        )).fetchall()
+    return [
+        {
+            "sourceType": str(row[0] or "unknown"),
+            "observed": int(row[1] or 0),
+            "pending": int(row[2] or 0),
+            "finalized": int(row[3] or 0),
+            "hits": int(row[4] or 0),
+            "misses": int(row[5] or 0),
+            "latestCreatedAt": float(row[6] or 0),
+        }
+        for row in rows
+    ]
 
 
 async def save_model_artifact(

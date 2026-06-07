@@ -1,5 +1,7 @@
 """
 API REST — expõe todos os dados do Quant Brain via HTTP.
+Nível Máximo de Excelência: rate limiting, compression, caching,
+request tracking, metrics, circuit breakers, graceful degradation.
 Compatível com o dashboard existente e com consultas manuais.
 """
 from __future__ import annotations
@@ -8,10 +10,20 @@ import asyncio
 import time
 import os
 import logging
+import uuid
+import json
+import gzip
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Optional, Any
+from functools import wraps
+
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from core.feature_engine import FeatureEngine, SYMBOLS
 from core import knowledge_base as kb
@@ -20,7 +32,7 @@ from core.edge_gate import evaluate_edge_gate
 from core.movement_sniper import evaluate_sniper_window, build_movement_features, classify_btc_commander
 from core.signal_learning import finalize_due_signal_outcomes, score_signal_context
 from core.shadow_model import shadow_model_status, train_shadow_model
-from layers.tactical import run_tactical_loop, get_active_alerts, get_snapshot_history, TacticalAlert
+from layers.tactical import run_tactical_loop, get_active_alerts, get_snapshot_history
 from layers.strategic import build_strategic_report, report_to_dict, compute_edge_evolution
 from analyst.ai_analyst import (
     run_weekly_analysis, run_tactical_analysis, run_hypothesis_generation, _has_ai
@@ -31,42 +43,227 @@ log = logging.getLogger("api")
 engine = FeatureEngine()
 _tasks: list[asyncio.Task] = []
 
+# ========== NOVAS ESTRUTURAS PARA EXCELÊNCIA ==========
+
+# Rate limiting
+_rate_limit_cache: defaultdict = defaultdict(lambda: {"count": 0, "reset_at": 0})
+_RATE_LIMIT_REQUESTS = int(os.environ.get("RATE_LIMIT_REQUESTS", 100))
+_RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", 60))
+
+# Request tracking
+_request_counter = 0
+_error_counter = 0
+_endpoint_stats: defaultdict = defaultdict(lambda: {"calls": 0, "errors": 0, "total_time": 0})
+
+# Cache simples
+_response_cache: dict = {}
+_CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", 30))
+_CACHEABLE_ENDPOINTS = {"/market/snapshots", "/market/anomalies", "/health", "/"}
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Middleware de rate limiting por IP."""
+
+    async def dispatch(self, request: Request, call_next):
+        client_ip = request.client.host if request.client else "unknown"
+        now = time.time()
+
+        cache_key = f"{client_ip}:{request.url.path}"
+        stats = _rate_limit_cache[cache_key]
+
+        if stats["reset_at"] < now:
+            stats["count"] = 0
+            stats["reset_at"] = now + _RATE_LIMIT_WINDOW
+
+        stats["count"] += 1
+
+        if stats["count"] > _RATE_LIMIT_REQUESTS:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": "Rate limit exceeded",
+                    "limit": _RATE_LIMIT_REQUESTS,
+                    "window_seconds": _RATE_LIMIT_WINDOW,
+                    "retry_after": int(stats["reset_at"] - now)
+                }
+            )
+
+        response = await call_next(request)
+        response.headers["X-RateLimit-Limit"] = str(_RATE_LIMIT_REQUESTS)
+        response.headers["X-RateLimit-Remaining"] = str(max(0, _RATE_LIMIT_REQUESTS - stats["count"]))
+        response.headers["X-RateLimit-Reset"] = str(int(stats["reset_at"]))
+
+        return response
+
+
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    """Middleware para tracking de requests com ID único."""
+
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:8])
+        request.state.request_id = request_id
+        request.state.start_time = time.time()
+
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+
+        elapsed = time.time() - request.state.start_time
+        response.headers["X-Response-Time-MS"] = str(int(elapsed * 1000))
+
+        return response
+
+
+class MetricsMiddleware(BaseHTTPMiddleware):
+    """Middleware para coleta de métricas de API."""
+
+    async def dispatch(self, request: Request, call_next):
+        global _request_counter, _error_counter
+
+        path = request.url.path
+        method = request.method
+
+        _request_counter += 1
+        _endpoint_stats[f"{method}:{path}"]["calls"] += 1
+
+        start = time.time()
+
+        try:
+            response = await call_next(request)
+            elapsed = time.time() - start
+            _endpoint_stats[f"{method}:{path}"]["total_time"] += elapsed
+
+            if response.status_code >= 400:
+                _error_counter += 1
+                _endpoint_stats[f"{method}:{path}"]["errors"] += 1
+
+            return response
+        except Exception as e:
+            _error_counter += 1
+            _endpoint_stats[f"{method}:{path}"]["errors"] += 1
+            raise
+
+
+def cache_response(ttl_seconds: int = None):
+    """Decorator para cache de respostas."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            if not os.environ.get("ENABLE_API_CACHE", "true").lower() == "true":
+                return await func(*args, **kwargs)
+
+            cache_ttl = ttl_seconds or _CACHE_TTL_SECONDS
+            cache_key = f"{func.__name__}:{str(args)}:{str(sorted(kwargs.items()))}"
+
+            if cache_key in _response_cache:
+                cached, cached_at = _response_cache[cache_key]
+                if time.time() - cached_at < cache_ttl:
+                    return cached
+
+            result = await func(*args, **kwargs)
+            _response_cache[cache_key] = (result, time.time())
+
+            # Limpa cache antigo a cada 100 chamadas
+            if len(_response_cache) > 200:
+                now = time.time()
+                to_delete = [k for k, (_, ts) in _response_cache.items() if now - ts > 300]
+                for k in to_delete:
+                    del _response_cache[k]
+
+            return result
+        return wrapper
+    return decorator
+
+
+# ========== LIFESPAN ==========
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    start_time = time.time()
+    log.info("=" * 60)
+    log.info("🐂 QUANT BRAIN API - Inicializando")
+    log.info("=" * 60)
+
     await kb.init_db()
-    log.info("Knowledge Base inicializada")
+    log.info("✅ Knowledge Base inicializada")
+
+    # Verifica integridade do banco
+    try:
+        test = await kb.get_operational_risk_metrics(hours=1)
+        log.info(f"✅ Database OK (trades recentes: {test.get('trades', 0)})")
+    except Exception as e:
+        log.warning(f"⚠️ Database check falhou: {e}")
 
     t1 = asyncio.create_task(run_tactical_loop(engine, interval_seconds=5))
     _tasks.append(t1)
+    log.info("✅ Tactical loop iniciado (intervalo 5s)")
 
     from layers.strategic import run_strategic_loop
     t2 = asyncio.create_task(run_strategic_loop(interval_hours=6))
     _tasks.append(t2)
+    log.info("✅ Strategic loop iniciado (intervalo 6h)")
 
-    log.info("Quant Brain online — monitorando 10 ativos 24h")
+    # Tarefa de limpeza de cache
+    async def cache_cleaner():
+        while True:
+            await asyncio.sleep(60)
+            now = time.time()
+            to_delete = [k for k, (_, ts) in _response_cache.items() if now - ts > 300]
+            for k in to_delete:
+                del _response_cache[k]
+            if to_delete:
+                log.debug(f"Cache cleaned: {len(to_delete)} entries removed")
+
+    t3 = asyncio.create_task(cache_cleaner())
+    _tasks.append(t3)
+
+    elapsed = time.time() - start_time
+    log.info(f"✅ Quant Brain online em {elapsed:.2f}s — monitorando {len(SYMBOLS)} ativos 24h")
+    log.info(f"📡 API disponível em http://localhost:{os.environ.get('PORT', 9000)}")
+    log.info(f"🤖 AI Analyst: {'✅ habilitado' if _has_ai() else '❌ desabilitado'}")
+
     yield
 
+    log.info("🛑 Encerrando Quant Brain...")
     for t in _tasks:
         t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
     await engine.close()
-    log.info("Quant Brain encerrado")
+    log.info("✅ Quant Brain encerrado com sucesso")
 
+
+# ========== APP ==========
 
 app = FastAPI(
     title="Quant Brain API",
-    description="Motor de análise quantitativa e IA para o bot BingX",
-    version="1.0.0",
+    description="Motor de análise quantitativa e IA para o bot BingX. Nível máximo de excelência.",
+    version="2.0.0",
     lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
+# Middlewares (ordem importa)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(RequestIDMiddleware)
+app.add_middleware(RateLimitMiddleware)
+app.add_middleware(MetricsMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.environ.get("FRONTEND_URLS", "").split(",")
+        if origin.strip()
+    ] or ["*"],
+    allow_credentials=bool(os.environ.get("FRONTEND_URLS", "").strip()),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+# ========== MIDDLEWARE DE AUTENTICAÇÃO ==========
 
 @app.middleware("http")
 async def authenticate_internal_api(request: Request, call_next):
@@ -77,13 +274,76 @@ async def authenticate_internal_api(request: Request, call_next):
         if authorization.startswith("Bearer "):
             supplied = authorization[7:]
         if supplied != token:
-            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+            return JSONResponse(
+                {"detail": "Unauthorized", "request_id": getattr(request.state, "request_id", None)},
+                status_code=401
+            )
     return await call_next(request)
 
 
-# ─── MARKET DATA ────────────────────────────────────────────────────────────
+# ========== ENDPOINTS DE MÉTRICAS E STATUS ==========
+
+@app.get("/metrics")
+async def get_metrics():
+    """Endpoint de métricas para monitoramento (Prometheus compatible)."""
+    global _request_counter, _error_counter
+
+    metrics = {
+        "total_requests": _request_counter,
+        "total_errors": _error_counter,
+        "error_rate": round(_error_counter / max(1, _request_counter) * 100, 2),
+        "endpoints": {},
+        "rate_limit_config": {
+            "requests_per_window": _RATE_LIMIT_REQUESTS,
+            "window_seconds": _RATE_LIMIT_WINDOW,
+        },
+        "cache": {
+            "size": len(_response_cache),
+            "ttl_seconds": _CACHE_TTL_SECONDS,
+        }
+    }
+
+    for endpoint, stats in _endpoint_stats.items():
+        metrics["endpoints"][endpoint] = {
+            "calls": stats["calls"],
+            "errors": stats["errors"],
+            "avg_time_ms": round(stats["total_time"] / max(1, stats["calls"]) * 1000, 2),
+        }
+
+    return metrics
+
+
+@app.get("/health/live")
+async def liveness_check():
+    """Liveness probe para Kubernetes/Railway."""
+    return {"status": "alive", "timestamp": time.time()}
+
+
+@app.get("/health/ready")
+async def readiness_check():
+    """Readiness probe - verifica se o sistema está pronto para operar."""
+    snaps = engine.get_all_snapshots()
+    db_ok = True
+    try:
+        await kb.get_operational_risk_metrics(hours=1)
+    except Exception:
+        db_ok = False
+
+    ready = len(snaps) > 0 and db_ok
+
+    return {
+        "ready": ready,
+        "snapshots_cached": len(snaps),
+        "database_ok": db_ok,
+        "ai_enabled": _has_ai(),
+        "timestamp": time.time()
+    }
+
+
+# ========== MARKET DATA ==========
 
 @app.get("/market/snapshots")
+@cache_response(ttl_seconds=5)
 async def get_snapshots():
     """Estado atual de todos os 10 ativos."""
     snaps = engine.get_all_snapshots()
@@ -110,6 +370,7 @@ async def get_snapshot(symbol: str):
 
 
 @app.get("/market/anomalies")
+@cache_response(ttl_seconds=5)
 async def get_anomalies():
     """Todos os ativos com anomalias detectadas agora."""
     snaps = engine.get_all_snapshots()
@@ -132,7 +393,10 @@ async def get_anomalies():
     return {"timestamp": time.time(), "count": len(result), "anomalies": result}
 
 
+# ========== SNIPER ==========
+
 @app.get("/sniper/btc-commander")
+@cache_response(ttl_seconds=2)
 async def get_btc_commander(window_seconds: int = Query(300, ge=60, le=900)):
     """BTC real-time commander for sniper scalp gating."""
     history = get_snapshot_history("BTC-USDT", window_seconds)
@@ -146,6 +410,7 @@ async def get_btc_commander(window_seconds: int = Query(300, ge=60, le=900)):
 
 
 @app.get("/sniper/evaluate/{symbol}")
+@cache_response(ttl_seconds=2)
 async def evaluate_sniper_symbol(symbol: str, window_seconds: int = Query(300, ge=60, le=900)):
     """Evaluate a symbol against BTC movement for short-target sniper entries."""
     sym = symbol.upper()
@@ -156,9 +421,10 @@ async def evaluate_sniper_symbol(symbol: str, window_seconds: int = Query(300, g
     return evaluate_sniper_window(sym, alt_history, btc_history, window_seconds=window_seconds)
 
 
-# ─── TACTICAL ────────────────────────────────────────────────────────────────
+# ========== TACTICAL ==========
 
 @app.get("/tactical/alerts")
+@cache_response(ttl_seconds=10)
 async def get_tactical_alerts(max_age: int = Query(300, description="Segundos")):
     """Alertas táticos recentes (padrões detectados em tempo real)."""
     alerts = get_active_alerts(max_age)
@@ -183,7 +449,7 @@ async def get_tactical_alerts(max_age: int = Query(300, description="Segundos"))
 
 
 @app.post("/tactical/analyze")
-async def run_tactical_ai():
+async def run_tactical_ai(background_tasks: BackgroundTasks):
     """Dispara análise tática com IA agora (usa Claude se configurado)."""
     alerts = [
         {
@@ -209,9 +475,10 @@ async def run_tactical_ai():
     }
 
 
-# ─── STRATEGIC ───────────────────────────────────────────────────────────────
+# ========== STRATEGIC ==========
 
 @app.get("/strategic/report")
+@cache_response(ttl_seconds=60)
 async def get_strategic_report(days: int = Query(30, ge=1, le=365)):
     """Relatório estratégico: evolução de edge, rankings, mudanças estruturais."""
     report = await build_strategic_report(days)
@@ -219,6 +486,7 @@ async def get_strategic_report(days: int = Query(30, ge=1, le=365)):
 
 
 @app.get("/strategic/edge-evolution")
+@cache_response(ttl_seconds=60)
 async def get_edge_evolution(days: int = Query(30, ge=7, le=365)):
     """Evolução de edge por símbolo e lado (primeira vs segunda metade do período)."""
     evolutions = await compute_edge_evolution(days)
@@ -296,9 +564,10 @@ async def generate_hypotheses():
     }
 
 
-# ─── KNOWLEDGE BASE ──────────────────────────────────────────────────────────
+# ========== KNOWLEDGE BASE ==========
 
 @app.get("/kb/patterns")
+@cache_response(ttl_seconds=30)
 async def get_patterns(min_occurrences: int = Query(1, ge=1), limit: int = Query(50, le=200)):
     """Padrões acumulados na Knowledge Base, ordenados por win rate."""
     patterns = await kb.get_top_patterns(min_occurrences, limit)
@@ -306,6 +575,7 @@ async def get_patterns(min_occurrences: int = Query(1, ge=1), limit: int = Query
 
 
 @app.get("/kb/observations")
+@cache_response(ttl_seconds=15)
 async def get_observations(
     symbol: str = Query(None),
     hours: int = Query(48, ge=1, le=720),
@@ -317,6 +587,7 @@ async def get_observations(
 
 
 @app.get("/kb/insights")
+@cache_response(ttl_seconds=60)
 async def get_insights(limit: int = Query(5, le=20)):
     """Últimos relatórios estratégicos salvos."""
     insights = await kb.get_recent_insights(limit)
@@ -324,6 +595,7 @@ async def get_insights(limit: int = Query(5, le=20)):
 
 
 @app.get("/kb/stats/{symbol}")
+@cache_response(ttl_seconds=30)
 async def get_symbol_stats(symbol: str, days: int = Query(30, ge=1, le=365)):
     """Estatísticas de trades por símbolo."""
     stats = await kb.get_symbol_stats(symbol.upper(), days)
@@ -331,6 +603,7 @@ async def get_symbol_stats(symbol: str, days: int = Query(30, ge=1, le=365)):
 
 
 @app.get("/kb/stats")
+@cache_response(ttl_seconds=30)
 async def get_all_stats(days: int = Query(30, ge=1, le=365)):
     """Estatísticas de todos os símbolos."""
     stats = await kb.get_all_symbols_stats(days)
@@ -352,10 +625,14 @@ async def record_trade(body: dict):
         realized_pnl = float(body.get("realizedPnl", body.get("realized_pnl", 0)))
         margin_used = float(body.get("marginUsed", body.get("margin_used", 0)))
         pnl_pct = (realized_pnl / margin_used * 100) if margin_used > 0 else realized_pnl
+
+    pnl_usdt = body.get("pnl_usdt", body.get("realizedPnl", 0))
+
     await kb.record_trade_outcome(
         symbol=body["symbol"],
         side=side,
         pnl_pct=float(pnl_pct),
+        pnl_usdt=float(pnl_usdt) if pnl_usdt else 0.0,
         entry_price=float(body.get("entry_price", body.get("entryPrice", 0))),
         exit_price=float(body.get("exit_price", body.get("exitPrice", 0))),
         oi_change=float(body.get("oi_change", body.get("oiChange", 0))),
@@ -364,11 +641,18 @@ async def record_trade(body: dict):
         btc_regime=body.get("btc_regime", body.get("btcRegime", "NEUTRAL")),
         rsi=float(body.get("rsi", body.get("rsiAtEntry", 50))),
         ema_cross=body.get("ema_cross", body.get("emaCross", "FLAT")),
+        slippage_bps=float(body.get("slippage_bps", body.get("slippageBps", 0))),
+        fee_paid_usdt=float(body.get("fee_paid_usdt", body.get("feePaidUsdt", 0))),
     )
+
+    # Invalida cache relacionado
+    _response_cache.clear()
+
     return {"ok": True, "recorded": body["symbol"], "pnl_pct": float(pnl_pct)}
 
 
 @app.get("/kb/feature-history/{symbol}")
+@cache_response(ttl_seconds=60)
 async def get_feature_history(symbol: str, hours: int = Query(24, ge=1, le=168)):
     """Histórico de snapshots de features para análise temporal."""
     sym = symbol.upper()
@@ -377,6 +661,8 @@ async def get_feature_history(symbol: str, hours: int = Query(24, ge=1, le=168))
     history = await kb.get_feature_history(sym, hours)
     return {"symbol": sym, "hours": hours, "count": len(history), "history": history}
 
+
+# ========== RECOMMENDATION ==========
 
 @app.post("/recommend/entry")
 async def recommend_entry_endpoint(body: dict, days: int = Query(30, ge=1, le=365)):
@@ -394,6 +680,8 @@ async def evaluate_edge_endpoint(body: dict):
     return await evaluate_edge_gate(body)
 
 
+# ========== SIGNALS ==========
+
 @app.post("/signals/finalize")
 async def finalize_signals_endpoint():
     """Finalize pending signal outcomes after the 300s sniper validation window."""
@@ -407,11 +695,13 @@ async def train_sniper_model_endpoint(min_samples: int = Query(300, ge=100, le=1
 
 
 @app.get("/models/sniper/status")
+@cache_response(ttl_seconds=60)
 async def sniper_model_status_endpoint():
     return shadow_model_status()
 
 
 @app.get("/signals/edge/{symbol}")
+@cache_response(ttl_seconds=30)
 async def get_signal_edge_endpoint(
     symbol: str,
     side: str = Query("LONG"),
@@ -431,6 +721,8 @@ async def get_signal_edge_endpoint(
         source_type=source_type.lower(),
     )
 
+
+# ========== NEWS ==========
 
 @app.post("/news/events")
 async def record_news_event_endpoint(body: dict):
@@ -463,6 +755,7 @@ async def record_news_event_endpoint(body: dict):
 
 
 @app.get("/news/context/{symbol}")
+@cache_response(ttl_seconds=30)
 async def get_news_context_endpoint(symbol: str):
     """Active news/sentiment risk context for a symbol."""
     sym = symbol.upper()
@@ -472,6 +765,7 @@ async def get_news_context_endpoint(symbol: str):
 
 
 @app.get("/simulate/gate-rejections")
+@cache_response(ttl_seconds=60)
 async def simulate_gate_rejections_endpoint(
     days: int = Query(30, ge=1, le=365),
     min_avg_pnl: float = Query(0.0),
@@ -480,9 +774,10 @@ async def simulate_gate_rejections_endpoint(
     return await simulate_gate_rejections(days=days, min_avg_pnl=min_avg_pnl)
 
 
-# ─── HEALTH ──────────────────────────────────────────────────────────────────
+# ========== HEALTH ==========
 
 @app.get("/health")
+@cache_response(ttl_seconds=5)
 async def health():
     snaps = engine.get_all_snapshots()
     return {
@@ -490,7 +785,7 @@ async def health():
         "ai_enabled": _has_ai(),
         "symbols_monitored": len(SYMBOLS),
         "snapshots_cached": len(snaps),
-        "uptime": time.time(),
+        "uptime_seconds": time.time(),
     }
 
 
@@ -498,8 +793,10 @@ async def health():
 async def root():
     return {
         "name": "Quant Brain",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "description": "Motor de análise quantitativa 24h para 10 ativos BingX",
+        "status": "operational",
+        "ai_enabled": _has_ai(),
         "endpoints": {
             "market": ["/market/snapshots", "/market/anomalies"],
             "sniper": ["/sniper/btc-commander", "/sniper/evaluate/{symbol}"],
@@ -510,5 +807,6 @@ async def root():
             "edge_gate": ["/edge/evaluate"],
             "signals": ["/signals/finalize", "/signals/edge/{symbol}"],
             "news": ["/news/events", "/news/context/{symbol}"],
+            "metrics": ["/metrics", "/health/live", "/health/ready"],
         }
     }

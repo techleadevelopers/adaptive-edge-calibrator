@@ -452,11 +452,15 @@ async def _update_hourly_metrics(db: Any, symbol: str, side: str, pnl_pct: float
         """INSERT INTO hourly_metrics (symbol, hour_utc, date, trades, wins, total_pnl_pct, avg_pnl_pct, win_rate)
            VALUES (?, ?, ?, 1, ?, ?, ?, ?)
            ON CONFLICT(symbol, date, hour_utc) DO UPDATE SET
-               trades = trades + 1,
-               wins = wins + excluded.wins,
-               total_pnl_pct = total_pnl_pct + excluded.total_pnl_pct,
-               avg_pnl_pct = total_pnl_pct / trades,
-               win_rate = CAST(wins AS REAL) / trades""",
+               trades = hourly_metrics.trades + 1,
+               wins = hourly_metrics.wins + excluded.wins,
+               total_pnl_pct = hourly_metrics.total_pnl_pct + excluded.total_pnl_pct,
+               avg_pnl_pct = (
+                   hourly_metrics.total_pnl_pct + excluded.total_pnl_pct
+               ) / (hourly_metrics.trades + 1),
+               win_rate = CAST(
+                   hourly_metrics.wins + excluded.wins AS REAL
+               ) / (hourly_metrics.trades + 1)""",
         (symbol, hour_utc, date, win, pnl_pct, pnl_pct, pnl_pct if win else 0)
     )
 
@@ -470,11 +474,15 @@ async def _update_daily_metrics(db: Any, symbol: str, side: str, pnl_pct: float,
         """INSERT INTO daily_symbol_metrics (symbol, side, date, trades, wins, total_pnl_pct, avg_pnl_pct, win_rate)
            VALUES (?, ?, ?, 1, ?, ?, ?, ?)
            ON CONFLICT(symbol, side, date) DO UPDATE SET
-               trades = trades + 1,
-               wins = wins + excluded.wins,
-               total_pnl_pct = total_pnl_pct + excluded.total_pnl_pct,
-               avg_pnl_pct = total_pnl_pct / trades,
-               win_rate = CAST(wins AS REAL) / trades""",
+               trades = daily_symbol_metrics.trades + 1,
+               wins = daily_symbol_metrics.wins + excluded.wins,
+               total_pnl_pct = daily_symbol_metrics.total_pnl_pct + excluded.total_pnl_pct,
+               avg_pnl_pct = (
+                   daily_symbol_metrics.total_pnl_pct + excluded.total_pnl_pct
+               ) / (daily_symbol_metrics.trades + 1),
+               win_rate = CAST(
+                   daily_symbol_metrics.wins + excluded.wins AS REAL
+               ) / (daily_symbol_metrics.trades + 1)""",
         (symbol, side, date, win, pnl_pct, pnl_pct, pnl_pct if win else 0)
     )
 

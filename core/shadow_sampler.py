@@ -8,7 +8,7 @@ from typing import Any
 from core.feature_engine import FeatureEngine, SYMBOLS
 from core.movement_sniper import evaluate_sniper_window
 from core.signal_learning import record_signal_from_gate
-from layers.tactical import get_snapshot_history
+from layers.tactical import get_snapshot_history, process_tactical_cycle
 
 
 SHADOW_SAMPLER_SOURCE_TYPE = "shadow_sampler"
@@ -23,6 +23,7 @@ _sampler_state: dict[str, Any] = {
     "attempted": 0,
     "recorded": 0,
     "skippedNoData": 0,
+    "bootstrapCycles": 0,
     "lastAnalyses": [],
 }
 
@@ -91,6 +92,7 @@ def _compact_analysis(symbol: str, fallback_side: str, sniper: dict[str, Any], r
 async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
     config = _sampler_config()
     window_seconds = _env_int("SHADOW_SAMPLER_WINDOW_SECONDS", 300)
+    bootstrap_samples = max(3, _env_int("SHADOW_SAMPLER_BOOTSTRAP_SAMPLES", 3))
     symbols = [
         symbol.strip().upper()
         for symbol in os.environ.get("SHADOW_SAMPLER_SYMBOLS", ",".join(SYMBOLS)).split(",")
@@ -98,7 +100,14 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
     ]
 
     if not engine.get_all_snapshots():
-        await engine.snapshot_all()
+        await process_tactical_cycle(engine)
+
+    btc_history = get_snapshot_history("BTC-USDT", max(window_seconds, 900))
+    if len(btc_history) < bootstrap_samples:
+        for _ in range(bootstrap_samples - len(btc_history)):
+            await process_tactical_cycle(engine)
+            _sampler_state["bootstrapCycles"] = int(_sampler_state["bootstrapCycles"]) + 1
+            await asyncio.sleep(0.25)
 
     attempted = 0
     recorded = 0
@@ -109,7 +118,7 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
         sym = symbol if symbol.endswith("-USDT") else f"{symbol}-USDT"
         alt_history = get_snapshot_history(sym, max(window_seconds, 900))
         btc_history = get_snapshot_history("BTC-USDT", max(window_seconds, 900))
-        if len(alt_history) < 3 or len(btc_history) < 3:
+        if len(alt_history) < bootstrap_samples or len(btc_history) < bootstrap_samples:
             skipped_no_data += 1
             continue
 
@@ -128,6 +137,8 @@ async def sample_shadow_signals_once(engine: FeatureEngine) -> dict[str, Any]:
             analyses.append(_compact_analysis(sym, fallback_side, sniper, was_recorded))
 
     _sampler_state.update({
+        "enabled": _env_bool("SHADOW_SAMPLER_ENABLED", True),
+        "running": True,
         "lastRunAt": time.time(),
         "lastError": None,
         "cycles": int(_sampler_state["cycles"]) + 1,

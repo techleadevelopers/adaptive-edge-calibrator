@@ -32,7 +32,7 @@ from core.recommendation import recommend_entry, simulate_gate_rejections
 from core.edge_gate import evaluate_edge_gate
 from core.movement_sniper import evaluate_sniper_window, build_movement_features, classify_btc_commander
 from core.signal_learning import finalize_due_signal_outcomes, score_signal_context
-from core.shadow_model import shadow_model_status, train_shadow_model
+from core.shadow_model import restore_shadow_model, shadow_model_status, train_shadow_model
 from layers.tactical import run_tactical_loop, get_active_alerts, get_snapshot_history
 from layers.strategic import build_strategic_report, report_to_dict, compute_edge_evolution
 from analyst.ai_analyst import (
@@ -52,7 +52,11 @@ _runtime_state = {
 _DB_INIT_TIMEOUT_SECONDS = float(os.environ.get("DB_INIT_TIMEOUT_SECONDS", "20"))
 _DB_INIT_RETRY_SECONDS = float(os.environ.get("DB_INIT_RETRY_SECONDS", "10"))
 _MODEL_MAINTENANCE_SECONDS = float(os.environ.get("MODEL_MAINTENANCE_SECONDS", "30"))
+_RETENTION_MAINTENANCE_SECONDS = float(
+    os.environ.get("RETENTION_MAINTENANCE_SECONDS", "3600")
+)
 _last_model_training_attempt_samples = 0
+_last_retention_maintenance_at = 0.0
 
 # ========== NOVAS ESTRUTURAS PARA EXCELÊNCIA ==========
 
@@ -188,12 +192,13 @@ def cache_response(ttl_seconds: int = None):
 # ========== LIFESPAN ==========
 
 async def _run_model_maintenance_loop():
-    global _last_model_training_attempt_samples
+    global _last_model_training_attempt_samples, _last_retention_maintenance_at
 
     while True:
         try:
             await finalize_due_signal_outcomes()
-            summary = await kb.get_signal_training_summary()
+            await restore_shadow_model()
+            summary = await kb.get_signal_training_summary(decision_group=None)
             status = shadow_model_status()
             trained_samples = int(status.get("samples", 0) or 0)
             samples = int(summary["samples"])
@@ -214,6 +219,11 @@ async def _run_model_maintenance_loop():
                     samples,
                     result.get("reason"),
                 )
+            if time.time() - _last_retention_maintenance_at >= _RETENTION_MAINTENANCE_SECONDS:
+                deleted = await kb.cleanup_retention()
+                _last_retention_maintenance_at = time.time()
+                if any(deleted.values()):
+                    log.info("Retention cleanup completed: %s", deleted)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -781,8 +791,9 @@ async def train_sniper_model_endpoint(min_samples: int = Query(300, ge=100, le=1
 @app.get("/models/sniper/status")
 @cache_response(ttl_seconds=60)
 async def sniper_model_status_endpoint():
+    await restore_shadow_model()
     status = shadow_model_status()
-    progress = await kb.get_signal_training_summary()
+    progress = await kb.get_signal_training_summary(decision_group=None)
     pipeline = await kb.get_signal_pipeline_summary()
     samples = int(progress["samples"])
     return {

@@ -19,6 +19,9 @@ from typing import Optional
 import httpx
 
 BINGX_BASE = "https://open-api.bingx.com"
+HTTP_CONCURRENCY = max(1, int(os.environ.get("FEATURE_HTTP_CONCURRENCY", "8")))
+SNAPSHOT_CONCURRENCY = max(1, int(os.environ.get("FEATURE_SNAPSHOT_CONCURRENCY", "3")))
+HTTP_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("FEATURE_HTTP_TIMEOUT_SECONDS", "4")))
 SYMBOLS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "VVV-USDT", "TRUMP-USDT",
     "MELANIA-USDT", "BEAT-USDT", "NEAR-USDT", "HYPE-USDT", "POL-USDT",
@@ -82,6 +85,8 @@ class FeatureEngine:
         self._last_snapshot_time: dict[str, float] = {}
         self._heartbeat_counter: dict[str, int] = {s: 0 for s in SYMBOLS}
         self._websocket_connected: bool = False
+        self._http_semaphore = asyncio.Semaphore(HTTP_CONCURRENCY)
+        self._snapshot_semaphore = asyncio.Semaphore(SNAPSHOT_CONCURRENCY)
 
     def on_snapshot(self, fn):
         self._callbacks.append(fn)
@@ -89,7 +94,13 @@ class FeatureEngine:
     @property
     def client(self) -> httpx.AsyncClient:
         if not self._client:
-            self._client = httpx.AsyncClient(timeout=8.0)
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS),
+                limits=httpx.Limits(
+                    max_connections=max(HTTP_CONCURRENCY, SNAPSHOT_CONCURRENCY) * 2,
+                    max_keepalive_connections=max(HTTP_CONCURRENCY, SNAPSHOT_CONCURRENCY),
+                ),
+            )
         return self._client
 
     def _sign(self, params: dict) -> str:
@@ -107,7 +118,8 @@ class FeatureEngine:
         if api_key:
             headers["X-BX-APIKEY"] = api_key
         try:
-            r = await self.client.get(f"{BINGX_BASE}{path}", params=p, headers=headers)
+            async with self._http_semaphore:
+                r = await self.client.get(f"{BINGX_BASE}{path}", params=p, headers=headers)
             return r.json()
         except Exception as e:
             return {"code": -1, "error": str(e)}
@@ -438,6 +450,10 @@ class FeatureEngine:
         return anomalies
 
     async def _snapshot_symbol(self, symbol: str) -> Optional[MarketSnapshot]:
+        async with self._snapshot_semaphore:
+            return await self._snapshot_symbol_unlimited(symbol)
+
+    async def _snapshot_symbol_unlimited(self, symbol: str) -> Optional[MarketSnapshot]:
         start_time = time.time()
 
         # Busca dados com timeout e retry

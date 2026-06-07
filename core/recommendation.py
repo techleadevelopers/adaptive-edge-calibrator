@@ -7,8 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-import aiosqlite
-
+from core.database import connect, table_columns
 from core.knowledge_base import DB_PATH
 
 
@@ -425,10 +424,8 @@ async def _load_trades(days: int = 30, include_usdt: bool = True) -> list[TradeR
     since = time.time() - days * 86400
 
     # Verifica se coluna pnl_usdt existe
-    async with aiosqlite.connect(DB_PATH) as db:
-        columns = {
-            row[1] for row in await (await db.execute("PRAGMA table_info(trade_outcomes)")).fetchall()
-        }
+    async with connect(DB_PATH) as db:
+        columns = await table_columns("trade_outcomes", DB_PATH)
         has_pnl_usdt = "pnl_usdt" in columns
 
         if has_pnl_usdt and include_usdt:

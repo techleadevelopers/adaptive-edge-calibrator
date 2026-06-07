@@ -722,7 +722,8 @@ async def record_trade(body: dict):
 
     pnl_usdt = body.get("pnl_usdt", body.get("realizedPnl", 0))
 
-    await kb.record_trade_outcome(
+    recorded = await kb.record_trade_outcome(
+        source_id=str(body.get("id") or "") or None,
         symbol=body["symbol"],
         side=side,
         pnl_pct=float(pnl_pct),
@@ -742,7 +743,12 @@ async def record_trade(body: dict):
     # Invalida cache relacionado
     _response_cache.clear()
 
-    return {"ok": True, "recorded": body["symbol"], "pnl_pct": float(pnl_pct)}
+    return {
+        "ok": True,
+        "recorded": recorded,
+        "symbol": body["symbol"],
+        "pnl_pct": float(pnl_pct),
+    }
 
 
 @app.get("/kb/feature-history/{symbol}")

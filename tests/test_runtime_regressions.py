@@ -5,7 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from core import knowledge_base as kb
 from layers.strategic import build_strategic_report
@@ -84,14 +84,15 @@ class RuntimeRegressionTest(unittest.TestCase):
         async def blocked_init():
             await asyncio.sleep(60)
 
+        async def close_engine():
+            return None
+
         async def scenario():
             server._tasks.clear()
-            with (
-                patch.object(server.kb, "init_db", side_effect=blocked_init),
-                patch.object(server.engine, "close", new=AsyncMock()),
-            ):
-                async with server.lifespan(server.app):
-                    return await server.liveness_check()
+            with patch.object(server.kb, "init_db", side_effect=blocked_init):
+                with patch.object(server.engine, "close", new=close_engine):
+                    async with server.lifespan(server.app):
+                        return await server.liveness_check()
 
         result = asyncio.run(scenario())
         self.assertEqual(result["status"], "alive")

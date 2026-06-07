@@ -50,6 +50,8 @@ _runtime_state = {
 }
 _DB_INIT_TIMEOUT_SECONDS = float(os.environ.get("DB_INIT_TIMEOUT_SECONDS", "20"))
 _DB_INIT_RETRY_SECONDS = float(os.environ.get("DB_INIT_RETRY_SECONDS", "10"))
+_MODEL_MAINTENANCE_SECONDS = float(os.environ.get("MODEL_MAINTENANCE_SECONDS", "30"))
+_last_model_training_attempt_samples = 0
 
 # ========== NOVAS ESTRUTURAS PARA EXCELÊNCIA ==========
 
@@ -184,6 +186,41 @@ def cache_response(ttl_seconds: int = None):
 
 # ========== LIFESPAN ==========
 
+async def _run_model_maintenance_loop():
+    global _last_model_training_attempt_samples
+
+    while True:
+        try:
+            await finalize_due_signal_outcomes()
+            summary = await kb.get_signal_training_summary()
+            status = shadow_model_status()
+            trained_samples = int(status.get("samples", 0) or 0)
+            samples = int(summary["samples"])
+            needs_initial_train = not status.get("available") and samples >= 300
+            needs_refresh = status.get("available") and samples >= trained_samples + 100
+            unseen_attempt = samples > _last_model_training_attempt_samples
+
+            if (
+                (needs_initial_train or needs_refresh)
+                and summary["hasBothClasses"]
+                and unseen_attempt
+            ):
+                _last_model_training_attempt_samples = samples
+                result = await train_shadow_model(min_samples=300)
+                log.info(
+                    "Shadow model training completed: trained=%s samples=%s reason=%s",
+                    result.get("trained"),
+                    samples,
+                    result.get("reason"),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Signal/model maintenance failed")
+
+        await asyncio.sleep(_MODEL_MAINTENANCE_SECONDS)
+
+
 async def _initialize_runtime_services():
     """Initialize persistent state without blocking HTTP health probes."""
     while True:
@@ -219,6 +256,13 @@ async def _initialize_runtime_services():
         strategic_task = asyncio.create_task(run_strategic_loop(interval_hours=6))
         _tasks.append(strategic_task)
         log.info("Strategic loop started (6h interval)")
+
+        model_task = asyncio.create_task(_run_model_maintenance_loop())
+        _tasks.append(model_task)
+        log.info(
+            "Signal finalizer/model maintenance started (%.1fs interval)",
+            _MODEL_MAINTENANCE_SECONDS,
+        )
 
         _runtime_state["services_started"] = True
         return
@@ -735,7 +779,20 @@ async def train_sniper_model_endpoint(min_samples: int = Query(300, ge=100, le=1
 @app.get("/models/sniper/status")
 @cache_response(ttl_seconds=60)
 async def sniper_model_status_endpoint():
-    return shadow_model_status()
+    status = shadow_model_status()
+    progress = await kb.get_signal_training_summary()
+    samples = int(progress["samples"])
+    return {
+        **status,
+        "samples": int(status.get("samples", samples) or samples),
+        "trainingSamplesAvailable": samples,
+        "minSamples": 300,
+        "samplesRemaining": max(0, 300 - samples),
+        "hits": progress["hits"],
+        "misses": progress["misses"],
+        "hasBothClasses": progress["hasBothClasses"],
+        "trainingMode": "automatic_shadow",
+    }
 
 
 @app.get("/signals/edge/{symbol}")

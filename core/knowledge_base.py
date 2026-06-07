@@ -707,6 +707,35 @@ async def get_signal_training_rows(
     return result
 
 
+async def get_signal_training_summary(
+    decision_group: str = "ALLOW",
+    source_type: str = "hypothetical",
+) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute(
+            """SELECT COUNT(*) AS samples,
+                      SUM(CASE WHEN hit_configured=1 THEN 1 ELSE 0 END) AS hits,
+                      SUM(CASE WHEN hit_configured=0 THEN 1 ELSE 0 END) AS misses,
+                      MAX(created_at) AS latest_created_at
+               FROM signal_outcomes
+               WHERE finalized=1 AND decision_group=? AND source_type=?
+                 AND hit_configured IS NOT NULL""",
+            (decision_group, source_type),
+        )).fetchone()
+
+    values = row or (0, 0, 0, 0)
+    samples = int(values[0] or 0)
+    hits = int(values[1] or 0)
+    misses = int(values[2] or 0)
+    return {
+        "samples": samples,
+        "hits": hits,
+        "misses": misses,
+        "hasBothClasses": hits > 0 and misses > 0,
+        "latestCreatedAt": float(values[3] or 0),
+    }
+
+
 async def get_operational_risk_metrics(hours: int = 24) -> dict:
     since = time.time() - hours * 3600
     async with aiosqlite.connect(DB_PATH) as db:

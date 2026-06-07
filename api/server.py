@@ -35,6 +35,7 @@ from core.signal_learning import finalize_due_signal_outcomes, score_signal_cont
 from core.shadow_model import restore_shadow_model, shadow_model_status, train_shadow_model
 from core.shadow_sampler import shadow_sampler_status, sample_shadow_signals_once
 from core.job_supervisor import JobSupervisor
+from core.candle_regime import analyze_macro_candle_regime, candle_regime_status
 from layers.tactical import process_tactical_cycle, get_active_alerts, get_snapshot_history
 from layers.strategic import build_strategic_report, report_to_dict, compute_edge_evolution
 from analyst.ai_analyst import (
@@ -60,6 +61,8 @@ _JOB_STALE_AFTER_SECONDS = max(30, int(float(os.environ.get("JOB_STALE_AFTER_SEC
 _TACTICAL_JOB_TIMEOUT_SECONDS = max(5, int(float(os.environ.get("TACTICAL_JOB_TIMEOUT_SECONDS", "20"))))
 _SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS = max(5, int(float(os.environ.get("SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS", "25"))))
 _MODEL_JOB_TIMEOUT_SECONDS = max(10, int(float(os.environ.get("MODEL_JOB_TIMEOUT_SECONDS", "45"))))
+_MACRO_CANDLE_ANALYSIS_SECONDS = max(60, int(float(os.environ.get("MACRO_CANDLE_ANALYSIS_SECONDS", "900"))))
+_MACRO_CANDLE_JOB_TIMEOUT_SECONDS = max(10, int(float(os.environ.get("MACRO_CANDLE_JOB_TIMEOUT_SECONDS", "30"))))
 job_supervisor = JobSupervisor(
     max_concurrent_jobs=_JOB_MAX_CONCURRENCY,
     stale_after_seconds=_JOB_STALE_AFTER_SECONDS,
@@ -314,6 +317,15 @@ async def _initialize_runtime_services():
     )
     log.info(f"Signal finalizer/model maintenance registered ({_MODEL_MAINTENANCE_SECONDS:.1f}s interval)")
 
+    job_supervisor.register(
+        "macro_candle_regime",
+        lambda: analyze_macro_candle_regime(engine, SYMBOLS),
+        interval_seconds=_MACRO_CANDLE_ANALYSIS_SECONDS,
+        timeout_seconds=_MACRO_CANDLE_JOB_TIMEOUT_SECONDS,
+        priority="low",
+        run_immediately=False,
+    )
+
     sampler_interval = max(15, int(float(os.environ.get("SHADOW_SAMPLER_INTERVAL_SECONDS", "60"))))
     job_supervisor.register(
         "shadow_signal_sampler",
@@ -322,6 +334,7 @@ async def _initialize_runtime_services():
         timeout_seconds=_SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS,
         priority="low",
         enabled=os.environ.get("SHADOW_SAMPLER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
+        run_immediately=False,
     )
     job_supervisor.start()
     log.info(f"Runtime job supervisor started with {len(job_supervisor.jobs)} jobs")
@@ -543,6 +556,13 @@ async def get_anomalies():
             })
     result.sort(key=lambda x: len(x["anomalies"]), reverse=True)
     return {"timestamp": time.time(), "count": len(result), "anomalies": result}
+
+
+@app.get("/market/macro-regime")
+@cache_response(ttl_seconds=15)
+async def get_macro_candle_regime():
+    """15m heavy candle regime: 1h/4h/1d bias and correction risk."""
+    return candle_regime_status()
 
 
 # ========== SNIPER ==========
@@ -882,8 +902,9 @@ async def train_sniper_model_endpoint(min_samples: int = Query(300, ge=100, le=1
 
 
 @app.get("/models/sniper/status")
-@cache_response(ttl_seconds=60)
+@cache_response(ttl_seconds=10)
 async def sniper_model_status_endpoint():
+    await finalize_due_signal_outcomes()
     await restore_shadow_model()
     status = shadow_model_status()
     progress = await kb.get_signal_training_summary(decision_group=None, source_type=None)
@@ -904,6 +925,7 @@ async def sniper_model_status_endpoint():
         "signalPipeline": pipeline,
         "signalSources": sources,
         "shadowSampler": shadow_sampler_status(),
+        "macroCandleRegime": candle_regime_status(),
         "recentShadowSignals": recent_shadow,
     }
 

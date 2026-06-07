@@ -244,73 +244,58 @@ async def _run_model_maintenance_loop():
             log.exception("Signal/model maintenance failed")
 
         await asyncio.sleep(_MODEL_MAINTENANCE_SECONDS)
-
+        
 async def _initialize_runtime_services():
     """Initialize persistent state without blocking HTTP health probes."""
-    while True:
-        try:
-            await asyncio.wait_for(kb.init_db(), timeout=_DB_INIT_TIMEOUT_SECONDS)
-            
-            # 🔻 COMENTADO - ESTAVA TRAVANDO A INICIALIZAÇÃO 🔻
-            # await asyncio.wait_for(
-            #     kb.get_operational_risk_metrics(hours=1),
-            #     timeout=_DB_INIT_TIMEOUT_SECONDS,
-            # )
-            
-            # 🔻 FALLBACK - VALOR PADRÃO ENQUANTO NÃO TEM DADOS 🔻
-            _runtime_state["operational_risk"] = {
-                "hours": 1,
-                "trades": 0,
-                "netPnlPct": 0.0,
-                "maxDrawdownPct": 0.0,
-                "consecutiveLosses": 0,
-            }
-            log.info("Operational risk metrics: using default values (no trades yet)")
-            
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _runtime_state["database_ready"] = False
-            _runtime_state["startup_error"] = f"{type(exc).__name__}: {exc}"
-            log.exception(
-                "Knowledge Base initialization failed; retrying in %.1fs",
-                _DB_INIT_RETRY_SECONDS,
-            )
-            await asyncio.sleep(_DB_INIT_RETRY_SECONDS)
-            continue
-
+    # 🔥 MUDA AQUI: Tenta apenas UMA vez, sem loop infinito
+    try:
+        await asyncio.wait_for(kb.init_db(), timeout=_DB_INIT_TIMEOUT_SECONDS)
+        
+        # FALLBACK - VALOR PADRÃO ENQUANTO NÃO TEM DADOS
+        _runtime_state["operational_risk"] = {
+            "hours": 1,
+            "trades": 0,
+            "netPnlPct": 0.0,
+            "maxDrawdownPct": 0.0,
+            "consecutiveLosses": 0,
+        }
+        log.info("Operational risk metrics: using default values (no trades yet)")
+        
         _runtime_state["database_ready"] = True
         _runtime_state["startup_error"] = None
         log.info("Knowledge Base initialized")
+        
+    except asyncio.TimeoutError:
+        _runtime_state["database_ready"] = False
+        _runtime_state["startup_error"] = "KB init timeout"
+        log.error(f"Knowledge Base initialization TIMEOUT after {_DB_INIT_TIMEOUT_SECONDS}s - continuing anyway")
+        
+    except Exception as exc:
+        _runtime_state["database_ready"] = False
+        _runtime_state["startup_error"] = f"{type(exc).__name__}: {exc}"
+        log.exception("Knowledge Base initialization failed - continuing anyway")
 
-        tactical_task = asyncio.create_task(
-            run_tactical_loop(engine, interval_seconds=5)
-        )
-        _tasks.append(tactical_task)
-        log.info("Tactical loop started (5s interval)")
+    # 🔥 SEMPRE inicia os serviços, mesmo se o KB falhou
+    tactical_task = asyncio.create_task(run_tactical_loop(engine, interval_seconds=5))
+    _tasks.append(tactical_task)
+    log.info("Tactical loop started (5s interval)")
 
-        from layers.strategic import run_strategic_loop
-        strategic_task = asyncio.create_task(run_strategic_loop(interval_hours=6))
-        _tasks.append(strategic_task)
-        log.info("Strategic loop started (6h interval)")
+    from layers.strategic import run_strategic_loop
+    strategic_task = asyncio.create_task(run_strategic_loop(interval_hours=6))
+    _tasks.append(strategic_task)
+    log.info("Strategic loop started (6h interval)")
 
-        model_task = asyncio.create_task(_run_model_maintenance_loop())
-        _tasks.append(model_task)
-        log.info(
-            "Signal finalizer/model maintenance started (%.1fs interval)",
-            _MODEL_MAINTENANCE_SECONDS,
-        )
+    model_task = asyncio.create_task(_run_model_maintenance_loop())
+    _tasks.append(model_task)
+    log.info(f"Signal finalizer/model maintenance started ({_MODEL_MAINTENANCE_SECONDS:.1f}s interval)")
 
-        sampler_interval = max(15, int(float(os.environ.get("SHADOW_SAMPLER_INTERVAL_SECONDS", "60"))))
-        sampler_task = asyncio.create_task(
-            run_shadow_signal_sampler(engine, interval_seconds=sampler_interval)
-        )
-        _tasks.append(sampler_task)
-        log.info("Shadow signal sampler started (%ss interval)", sampler_interval)
+    sampler_interval = max(15, int(float(os.environ.get("SHADOW_SAMPLER_INTERVAL_SECONDS", "60"))))
+    sampler_task = asyncio.create_task(run_shadow_signal_sampler(engine, interval_seconds=sampler_interval))
+    _tasks.append(sampler_task)
+    log.info(f"Shadow signal sampler started ({sampler_interval}s interval)")
 
-        _runtime_state["services_started"] = True
-        return
-
+    _runtime_state["services_started"] = True
+    return
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -324,6 +309,7 @@ async def lifespan(app: FastAPI):
     _runtime_state["startup_error"] = None
     _runtime_state["started_at"] = start_time
 
+    # 🔥 MUDA AQUI: NÃO aguarda a inicialização dos serviços
     bootstrap_task = asyncio.create_task(_initialize_runtime_services())
     _tasks.append(bootstrap_task)
 
@@ -358,7 +344,6 @@ async def lifespan(app: FastAPI):
     await engine.close()
     await close_pool()
     log.info("✅ Quant Brain encerrado com sucesso")
-
 # ========== APP ==========
 
 app = FastAPI(

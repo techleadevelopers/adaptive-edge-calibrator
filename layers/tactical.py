@@ -432,16 +432,25 @@ async def _process_snapshot(snap: MarketSnapshot):
         "bid": snap.bid,
         "ask": snap.ask,
         "spread_bps": snap.spread_bps,
+        "effective_spread_bps": snap.effective_spread_bps,
         "atr_pct": snap.atr_pct,
         "price_change_pct": snap.price_change_pct,
         "oi_change_pct": snap.oi_change_pct,
         "funding_rate": snap.funding_rate,
         "volume_ratio": snap.volume_ratio,
+        "volume_imbalance": snap.volume_imbalance,
         "rsi": snap.rsi_approx,
         "btc_regime": snap.btc_regime,
         "timestamp": snap.timestamp,
         "high_24h": snap.high_24h,
         "low_24h": snap.low_24h,
+        "bid_depth_5": snap.bid_depth_5,
+        "ask_depth_5": snap.ask_depth_5,
+        "book_imbalance": snap.bid_ask_imbalance,
+        "cvd": snap.cumulative_delta,
+        "data_quality_score": snap.data_quality_score,
+        "price_confidence": snap.price_confidence,
+        "latency_ms": snap.latency_ms,
     })
 
     history = list(_snap_buffer[sym])
@@ -516,6 +525,10 @@ async def _process_snapshot(snap: MarketSnapshot):
             "atr_pct": snap.atr_pct,
             "spread_bps": snap.spread_bps,
             "btc_regime": snap.btc_regime,
+            "bid_depth_5": snap.bid_depth_5,
+            "ask_depth_5": snap.ask_depth_5,
+            "book_imbalance": snap.bid_ask_imbalance,
+            "cvd": snap.cumulative_delta,
         })
 
     if not snap.anomalies:

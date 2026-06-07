@@ -10,6 +10,7 @@ from typing import Any
 from dataclasses import dataclass
 
 from core import knowledge_base as kb
+from core.database import connect
 from core.movement_sniper import MovementFeatures
 from layers.tactical import get_snapshot_history
 
@@ -614,10 +615,9 @@ async def get_top_contexts(limit: int = 20) -> list[dict]:
 
 async def _get_all_contexts_from_db() -> list[str]:
     """Recupera todos os context keys do banco."""
-    import aiosqlite
     from core.knowledge_base import DB_PATH
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         rows = await (await db.execute(
             "SELECT DISTINCT context_key FROM signal_outcomes WHERE finalized=1 LIMIT 1000"
         )).fetchall()

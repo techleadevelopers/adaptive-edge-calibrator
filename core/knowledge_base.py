@@ -7,6 +7,7 @@ métricas agregadas, janelas temporais, view materializadas, cache de queries.
 from __future__ import annotations
 
 import json
+import os
 import time
 import asyncio
 from collections import OrderedDict
@@ -286,6 +287,13 @@ CREATE TABLE IF NOT EXISTS execution_quality (
     slippage_bps REAL NOT NULL,
     latency_ms REAL NOT NULL,
     timestamp REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS model_artifacts (
+    name TEXT PRIMARY KEY,
+    content BLOB NOT NULL,
+    metadata TEXT NOT NULL,
+    updated_at REAL NOT NULL
 );
 
 -- ========== ÍNDICES OTIMIZADOS ==========
@@ -684,22 +692,30 @@ async def get_signal_edge_stats(
 
 
 async def get_signal_training_rows(
-    decision_group: str = "ALLOW",
+    decision_group: str | None = None,
     source_type: str = "hypothetical",
     limit: int = 50000,
 ) -> list[dict]:
+    decision_filter = ""
+    params: list[Any] = [source_type]
+    if decision_group:
+        decision_filter = " AND decision_group=?"
+        params.append(decision_group)
+    params.append(limit)
     async with connect(DB_PATH) as db:
         db.row_factory = Row
         rows = await (await db.execute(
-            """SELECT signal_id, symbol, side, decision, context_key, features,
+            f"""SELECT signal_id, symbol, side, decision, decision_group,
+                      context_key, features,
                       target_configured_move_pct, estimated_cost_pct, hit_configured,
                       stopped, first_event, created_at
                FROM signal_outcomes
-               WHERE finalized=1 AND decision_group=? AND source_type=?
+               WHERE finalized=1 AND source_type=?
                  AND hit_configured IS NOT NULL
+                 {decision_filter}
                ORDER BY created_at ASC
                LIMIT ?""",
-            (decision_group, source_type, limit),
+            params,
         )).fetchall()
     result = []
     for row in rows:
@@ -710,19 +726,25 @@ async def get_signal_training_rows(
 
 
 async def get_signal_training_summary(
-    decision_group: str = "ALLOW",
+    decision_group: str | None = None,
     source_type: str = "hypothetical",
 ) -> dict:
+    decision_filter = ""
+    params: list[Any] = [source_type]
+    if decision_group:
+        decision_filter = " AND decision_group=?"
+        params.append(decision_group)
     async with connect(DB_PATH) as db:
         row = await (await db.execute(
-            """SELECT COUNT(*) AS samples,
+            f"""SELECT COUNT(*) AS samples,
                       SUM(CASE WHEN hit_configured=1 THEN 1 ELSE 0 END) AS hits,
                       SUM(CASE WHEN hit_configured=0 THEN 1 ELSE 0 END) AS misses,
                       MAX(created_at) AS latest_created_at
                FROM signal_outcomes
-               WHERE finalized=1 AND decision_group=? AND source_type=?
-                 AND hit_configured IS NOT NULL""",
-            (decision_group, source_type),
+               WHERE finalized=1 AND source_type=?
+                 AND hit_configured IS NOT NULL
+                 {decision_filter}""",
+            params,
         )).fetchone()
 
     values = row or (0, 0, 0, 0)
@@ -759,6 +781,78 @@ async def get_signal_pipeline_summary() -> dict:
         "waited": int(values[4] or 0),
         "blocked": int(values[5] or 0),
     }
+
+
+async def save_model_artifact(
+    name: str,
+    content: bytes,
+    metadata: dict,
+) -> None:
+    async with connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO model_artifacts (name, content, metadata, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET
+                   content=excluded.content,
+                   metadata=excluded.metadata,
+                   updated_at=excluded.updated_at""",
+            (name, content, json.dumps(metadata), time.time()),
+        )
+        await db.commit()
+
+
+async def get_model_artifact(name: str) -> dict | None:
+    async with connect(DB_PATH) as db:
+        row = await (await db.execute(
+            """SELECT content, metadata, updated_at
+               FROM model_artifacts WHERE name=?""",
+            (name,),
+        )).fetchone()
+    if not row:
+        return None
+    return {
+        "content": bytes(row[0]),
+        "metadata": json.loads(row[1]),
+        "updatedAt": float(row[2]),
+    }
+
+
+async def cleanup_retention(now: float | None = None) -> dict[str, int]:
+    current = now or time.time()
+    policies = {
+        "feature_snapshots": (
+            "timestamp",
+            int(os.environ.get("RETENTION_FEATURE_SNAPSHOTS_HOURS", "72")) * 3600,
+        ),
+        "signal_outcomes": (
+            "created_at",
+            int(os.environ.get("RETENTION_SIGNAL_OUTCOMES_DAYS", "120")) * 86400,
+        ),
+        "news_events": (
+            "expires_at",
+            int(os.environ.get("RETENTION_NEWS_EVENTS_DAYS", "7")) * 86400,
+        ),
+        "observations": (
+            "timestamp",
+            int(os.environ.get("RETENTION_OBSERVATIONS_DAYS", "30")) * 86400,
+        ),
+        "execution_quality": (
+            "timestamp",
+            int(os.environ.get("RETENTION_EXECUTION_QUALITY_DAYS", "30")) * 86400,
+        ),
+    }
+    deleted: dict[str, int] = {}
+    async with connect(DB_PATH) as db:
+        for table, (column, age_seconds) in policies.items():
+            cutoff = current - age_seconds
+            cursor = await db.execute(
+                f"DELETE FROM {table} WHERE {column} < ?",
+                (cutoff,),
+            )
+            deleted[table] = int(getattr(cursor, "rowcount", 0) or 0)
+        await db.commit()
+    _query_cache.clear()
+    return deleted
 
 
 async def get_operational_risk_metrics(hours: int = 24) -> dict:

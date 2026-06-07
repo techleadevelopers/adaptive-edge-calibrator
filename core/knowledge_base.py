@@ -738,6 +738,29 @@ async def get_signal_training_summary(
     }
 
 
+async def get_signal_pipeline_summary() -> dict:
+    async with connect(DB_PATH) as db:
+        row = await (await db.execute(
+            """SELECT COUNT(*) AS observed,
+                      SUM(CASE WHEN finalized=0 THEN 1 ELSE 0 END) AS pending,
+                      SUM(CASE WHEN finalized=1 THEN 1 ELSE 0 END) AS finalized,
+                      SUM(CASE WHEN decision_group='ALLOW' THEN 1 ELSE 0 END) AS allowed,
+                      SUM(CASE WHEN decision_group='WAIT' THEN 1 ELSE 0 END) AS waited,
+                      SUM(CASE WHEN decision_group='BLOCK' THEN 1 ELSE 0 END) AS blocked
+               FROM signal_outcomes"""
+        )).fetchone()
+
+    values = row or (0, 0, 0, 0, 0, 0)
+    return {
+        "observed": int(values[0] or 0),
+        "pending": int(values[1] or 0),
+        "finalized": int(values[2] or 0),
+        "allowed": int(values[3] or 0),
+        "waited": int(values[4] or 0),
+        "blocked": int(values[5] or 0),
+    }
+
+
 async def get_operational_risk_metrics(hours: int = 24) -> dict:
     since = time.time() - hours * 3600
     async with connect(DB_PATH) as db:

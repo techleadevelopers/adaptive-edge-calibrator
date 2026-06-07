@@ -657,22 +657,42 @@ async def _detect_lead_lag(snaps: dict[str, MarketSnapshot]):
                 )
 
 
-async def run_tactical_loop(engine: FeatureEngine, interval_seconds: int = 5):
-    """Loop principal tático — roda a cada N segundos."""
-    await kb.init_db()
-    log.info(f"Tactical loop iniciado (interval={interval_seconds}s)")
-    engine.on_snapshot(_process_snapshot)
-    last_signal_finalize = 0.0
+_tactical_initialized = False
+_last_signal_finalize = 0.0
 
+
+async def process_tactical_cycle(engine: FeatureEngine) -> dict:
+    """Run one bounded tactical cycle. Runtime supervisor owns scheduling."""
+    global _tactical_initialized, _last_signal_finalize
+
+    if not _tactical_initialized:
+        await kb.init_db()
+        engine.on_snapshot(_process_snapshot)
+        _tactical_initialized = True
+
+    snaps = await engine.snapshot_all()
+    await _detect_lead_lag(snaps)
+    now = time.time()
+    finalized = False
+    if now - _last_signal_finalize >= 60:
+        from core.signal_learning import finalize_due_signal_outcomes
+        await finalize_due_signal_outcomes()
+        _last_signal_finalize = now
+        finalized = True
+
+    return {
+        "snapshots": len(snaps),
+        "finalizedSignals": finalized,
+        "activeAlerts": len(_active_alerts),
+    }
+
+
+async def run_tactical_loop(engine: FeatureEngine, interval_seconds: int = 5):
+    """Compatibility loop. Prefer process_tactical_cycle under JobSupervisor."""
+    log.info(f"Tactical loop iniciado (interval={interval_seconds}s)")
     while True:
         try:
-            snaps = await engine.snapshot_all()
-            await _detect_lead_lag(snaps)
-            now = time.time()
-            if now - last_signal_finalize >= 60:
-                from core.signal_learning import finalize_due_signal_outcomes
-                await finalize_due_signal_outcomes()
-                last_signal_finalize = now
+            await process_tactical_cycle(engine)
         except Exception as e:
             log.error(f"Tactical loop error: {e}")
         await asyncio.sleep(interval_seconds)

@@ -13,7 +13,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, asdict
 from typing import Optional, Any
 from pathlib import Path
-import aiosqlite
+from core.database import IntegrityError, Row, connect, table_columns
 
 DB_PATH = Path(__file__).parent.parent / "data" / "knowledge.db"
 DB_PATH.parent.mkdir(exist_ok=True)
@@ -359,13 +359,11 @@ def _cache_set(query: str, params: tuple, value: Any):
 
 async def init_db():
     """Inicializa banco com todas as tabelas e migrações."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         await db.executescript(CREATE_TABLES)
 
         # Migrações para tabelas existentes
-        columns = {
-            row[1] for row in await (await db.execute("PRAGMA table_info(signal_outcomes)")).fetchall()
-        }
+        columns = await table_columns("signal_outcomes", DB_PATH)
         migrations = {
             "decision_group": "TEXT NOT NULL DEFAULT 'WAIT'",
             "source_type": "TEXT NOT NULL DEFAULT 'hypothetical'",
@@ -382,9 +380,7 @@ async def init_db():
                 await db.execute(f"ALTER TABLE signal_outcomes ADD COLUMN {name} {definition}")
 
         # Migrações para trade_outcomes (campos novos)
-        trade_columns = {
-            row[1] for row in await (await db.execute("PRAGMA table_info(trade_outcomes)")).fetchall()
-        }
+        trade_columns = await table_columns("trade_outcomes", DB_PATH)
         trade_migrations = {
             "pnl_usdt": "REAL",
             "slippage_bps": "REAL DEFAULT 0",
@@ -395,9 +391,7 @@ async def init_db():
                 await db.execute(f"ALTER TABLE trade_outcomes ADD COLUMN {name} {definition}")
 
         # Migrações para feature_snapshots
-        feature_columns = {
-            row[1] for row in await (await db.execute("PRAGMA table_info(feature_snapshots)")).fetchall()
-        }
+        feature_columns = await table_columns("feature_snapshots", DB_PATH)
         feature_migrations = {
             "bid_depth_5": "REAL",
             "ask_depth_5": "REAL",
@@ -431,7 +425,7 @@ async def record_trade_outcome(
 ):
     """Registra outcome de trade com métricas avançadas."""
     win = 1 if pnl_pct > 0 else 0
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO trade_outcomes
                (symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
@@ -447,7 +441,7 @@ async def record_trade_outcome(
         await db.commit()
 
 
-async def _update_hourly_metrics(db: aiosqlite.Connection, symbol: str, side: str, pnl_pct: float, win: int):
+async def _update_hourly_metrics(db: Any, symbol: str, side: str, pnl_pct: float, win: int):
     """Atualiza métricas horárias agregadas."""
     from datetime import datetime, timezone
     now_utc = datetime.now(timezone.utc)
@@ -467,7 +461,7 @@ async def _update_hourly_metrics(db: aiosqlite.Connection, symbol: str, side: st
     )
 
 
-async def _update_daily_metrics(db: aiosqlite.Connection, symbol: str, side: str, pnl_pct: float, win: int):
+async def _update_daily_metrics(db: Any, symbol: str, side: str, pnl_pct: float, win: int):
     """Atualiza métricas diárias agregadas."""
     from datetime import datetime, timezone
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -487,7 +481,7 @@ async def _update_daily_metrics(db: aiosqlite.Connection, symbol: str, side: str
 
 async def save_feature_snapshot(symbol: str, features: dict):
     """Salva snapshot de features com campos avançados."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO feature_snapshots
                (symbol, timestamp, price, price_change_pct, volume_ratio,
@@ -533,7 +527,7 @@ async def record_signal_decision(
 ) -> bool:
     if entry_price <= 0:
         return False
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         try:
             await db.execute(
                 """INSERT INTO signal_outcomes
@@ -567,14 +561,14 @@ async def record_signal_decision(
             )
             await db.commit()
             return True
-        except aiosqlite.IntegrityError:
+        except IntegrityError:
             return False
 
 
 async def get_pending_signal_outcomes(min_age_seconds: int = 300, limit: int = 200) -> list[dict]:
     cutoff = time.time() - min_age_seconds
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
         rows = await (await db.execute(
             """SELECT * FROM signal_outcomes
                WHERE finalized=0 AND created_at <= ?
@@ -601,7 +595,7 @@ async def finalize_signal_outcome(
     max_favorable_pct: float,
     max_adverse_pct: float,
 ) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         await db.execute(
             """UPDATE signal_outcomes
                SET price_30s=?, price_60s=?, price_120s=?, price_300s=?,
@@ -652,8 +646,8 @@ async def get_signal_edge_stats(
         where += " AND symbol=?"
         params.append(symbol)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
         row = await (await db.execute(
             f"""SELECT COUNT(*) as samples,
                        AVG(hit_configured) as hit_configured,
@@ -686,8 +680,8 @@ async def get_signal_training_rows(
     source_type: str = "hypothetical",
     limit: int = 50000,
 ) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
         rows = await (await db.execute(
             """SELECT signal_id, symbol, side, decision, context_key, features,
                       target_configured_move_pct, estimated_cost_pct, hit_configured,
@@ -711,7 +705,7 @@ async def get_signal_training_summary(
     decision_group: str = "ALLOW",
     source_type: str = "hypothetical",
 ) -> dict:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         row = await (await db.execute(
             """SELECT COUNT(*) AS samples,
                       SUM(CASE WHEN hit_configured=1 THEN 1 ELSE 0 END) AS hits,
@@ -738,7 +732,7 @@ async def get_signal_training_summary(
 
 async def get_operational_risk_metrics(hours: int = 24) -> dict:
     since = time.time() - hours * 3600
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         rows = await (await db.execute(
             """SELECT pnl_pct, timestamp
                FROM trade_outcomes
@@ -783,7 +777,7 @@ async def record_news_event(
     ttl_seconds: int = 7200,
 ) -> None:
     now = time.time()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO news_events
                (source, title, url, symbols, category, impact_score, risk_level,
@@ -808,8 +802,8 @@ async def record_news_event(
 
 async def get_active_news_context(symbol: str, now: float | None = None) -> dict:
     ts = now or time.time()
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
         rows = await (await db.execute(
             """SELECT * FROM news_events
                WHERE expires_at >= ?
@@ -850,7 +844,7 @@ async def upsert_pattern(
     name: str, symbol: str, conditions: dict,
     won: bool, pnl_pct: float
 ):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         row = await (await db.execute(
             "SELECT id, occurrences, wins, total_return FROM patterns WHERE name=? AND symbol=?",
             (name, symbol)
@@ -885,8 +879,8 @@ async def upsert_pattern(
 
 
 async def get_top_patterns(min_occurrences: int = 5, limit: int = 20) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
         rows = await (await db.execute(
             """SELECT * FROM patterns
                WHERE occurrences >= ?
@@ -899,8 +893,8 @@ async def get_top_patterns(min_occurrences: int = 5, limit: int = 20) -> list[di
 
 async def get_symbol_stats(symbol: str, days: int = 30) -> dict:
     since = time.time() - days * 86400
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
         rows = await (await db.execute(
             """SELECT side, COUNT(*) as trades,
                SUM(win) as wins,
@@ -939,7 +933,7 @@ async def get_all_symbols_stats(days: int = 30) -> list[dict]:
 
 
 async def save_observation(symbol: str, category: str, text: str, data: dict, confidence: float):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO observations (symbol, category, text, data, confidence, timestamp)
                VALUES (?,?,?,?,?,?)""",
@@ -952,7 +946,7 @@ async def save_strategic_insight(
     period_days: int, analysis_text: str,
     edge_changes: dict, recommendations: list
 ):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO strategic_insights
                (period_days, generated_at, analysis_text, edge_changes, recommendations)
@@ -964,8 +958,8 @@ async def save_strategic_insight(
 
 
 async def get_recent_insights(limit: int = 5) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
         rows = await (await db.execute(
             "SELECT * FROM strategic_insights ORDER BY generated_at DESC LIMIT ?",
             (limit,)
@@ -981,8 +975,8 @@ async def get_recent_insights(limit: int = 5) -> list[dict]:
 
 async def get_feature_history(symbol: str, hours: int = 24) -> list[dict]:
     since = time.time() - hours * 3600
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
         rows = await (await db.execute(
             """SELECT * FROM feature_snapshots
                WHERE symbol=? AND timestamp >= ?
@@ -994,8 +988,8 @@ async def get_feature_history(symbol: str, hours: int = 24) -> list[dict]:
 
 async def get_recent_observations(symbol: str = None, hours: int = 48, limit: int = 50) -> list[dict]:
     since = time.time() - hours * 3600
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
         if symbol:
             rows = await (await db.execute(
                 """SELECT * FROM observations
@@ -1025,8 +1019,8 @@ async def get_hour_toxicity(symbol: str, hour_utc: int, side: str) -> dict:
     Retorna toxicidade por horário baseado em histórico real.
     Quanto maior toxicity_score, mais o horário é perigoso para operar.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
         row = await (await db.execute(
             """SELECT trades, win_rate, avg_pnl_pct, toxicity_score
                FROM hour_toxicity
@@ -1062,7 +1056,7 @@ async def update_hour_toxicity(symbol: str, hour_utc: int, side: str, trades: li
     # Fórmula de toxicidade: win_rate baixo + avg_pnl negativo = tóxico
     toxicity_score = max(0.0, (0.5 - win_rate) + max(0.0, -avg_pnl * 0.5))
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO hour_toxicity (symbol, hour_utc, side, trades, win_rate, avg_pnl_pct, toxicity_score, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1081,8 +1075,8 @@ async def get_correlation(symbol_a: str, symbol_b: str, hours: int = 24) -> floa
     """Retorna correlação entre dois símbolos baseado em dados históricos."""
     correlation_key = f"{hours}h"
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
         row = await (await db.execute(
             """SELECT correlation_1h, correlation_4h, correlation_24h
                FROM symbol_correlations
@@ -1113,7 +1107,7 @@ async def record_execution_quality(
     """Registra qualidade de execução para análise de slippage real."""
     slippage_bps = abs(executed_price - expected_price) / expected_price * 10000 if expected_price > 0 else 0
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO execution_quality
                (symbol, side, expected_price, executed_price, slippage_bps, latency_ms, timestamp)
@@ -1127,7 +1121,7 @@ async def get_avg_slippage_bps(symbol: str, hours: int = 24) -> float:
     """Retorna slippage médio real para o símbolo nas últimas N horas."""
     since = time.time() - hours * 3600
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         row = await (await db.execute(
             """SELECT AVG(slippage_bps) as avg_slippage
                FROM execution_quality
@@ -1146,7 +1140,7 @@ async def get_realized_sharpe(symbol: str, side: str, days: int = 30) -> float:
     """Calcula Sharpe Ratio realizado para o símbolo/lado."""
     since = time.time() - days * 86400
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         rows = await (await db.execute(
             """SELECT pnl_pct FROM trade_outcomes
                WHERE symbol=? AND side=? AND timestamp >= ?
@@ -1173,7 +1167,7 @@ async def get_rolling_win_rate(symbol: str, side: str, window_hours: int = 24) -
     """Win rate em janela móvel para detecção de deterioração."""
     since = time.time() - window_hours * 3600
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         rows = await (await db.execute(
             """SELECT win FROM trade_outcomes
                WHERE symbol=? AND side=? AND timestamp >= ?
@@ -1191,6 +1185,6 @@ async def get_rolling_win_rate(symbol: str, side: str, window_hours: int = 24) -
 
 async def vacuum_db():
     """Otimiza o banco de dados - agendado semanalmente."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect(DB_PATH) as db:
         await db.execute("VACUUM")
         await db.execute("ANALYZE")

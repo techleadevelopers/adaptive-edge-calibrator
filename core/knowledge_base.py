@@ -7,6 +7,7 @@ métricas agregadas, janelas temporais, view materializadas, cache de queries.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import time
 import asyncio
@@ -23,6 +24,7 @@ DB_PATH.parent.mkdir(exist_ok=True)
 _query_cache: OrderedDict = OrderedDict()
 _CACHE_MAX_SIZE = 100
 _CACHE_TTL_SECONDS = 30
+OUTCOME_STALE_SECONDS = int(os.environ.get("SIGNAL_OUTCOME_STALE_SECONDS", "900"))
 
 
 @dataclass
@@ -172,6 +174,9 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     first_event_seconds REAL,
     max_favorable_pct REAL,
     max_adverse_pct REAL,
+    predicted_probability REAL,
+    prediction_timestamp REAL,
+    model_version TEXT,
     finalized INTEGER DEFAULT 0,
     created_at REAL NOT NULL,
     finalized_at REAL
@@ -372,6 +377,7 @@ async def init_db():
     """Inicializa banco com todas as tabelas e migrações."""
     async with connect(DB_PATH) as db:
         await db.executescript(CREATE_TABLES)
+        await db.commit()
 
         # Migrações para tabelas existentes
         columns = await table_columns("signal_outcomes", DB_PATH)
@@ -411,10 +417,28 @@ async def init_db():
             "ask_depth_5": "REAL",
             "book_imbalance": "REAL",
             "cvd": "REAL",
+            "bid": "REAL",
+            "ask": "REAL",
         }
         for name, definition in feature_migrations.items():
             if name not in feature_columns:
                 await db.execute(f"ALTER TABLE feature_snapshots ADD COLUMN {name} {definition}")
+
+        # Migrações para signal_outcomes
+        signal_columns = await table_columns("signal_outcomes", DB_PATH)
+        signal_migrations = {
+            "market_event_id": "TEXT",
+            "feature_version": "TEXT NOT NULL DEFAULT 'legacy'",
+            "label_version": "TEXT NOT NULL DEFAULT 'price-window-v1'",
+            "label_source": "TEXT",
+            "outcome_source_id": "TEXT",
+            "predicted_probability": "REAL",
+            "prediction_timestamp": "REAL",
+            "model_version": "TEXT",
+        }
+        for name, definition in signal_migrations.items():
+            if name not in signal_columns:
+                await db.execute(f"ALTER TABLE signal_outcomes ADD COLUMN {name} {definition}")
 
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_signal_decision_group "
@@ -428,8 +452,40 @@ async def init_db():
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_source_id "
             "ON trade_outcomes(source_id)"
         )
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_outcome_source "
+            "ON signal_outcomes(outcome_source_id)"
+        )
 
         await db.commit()
+
+
+async def _reconcile_signal_outcome_on_db(
+    db: Any,
+    signal_id: str,
+    outcome_source_id: str,
+    hit: bool,
+    label_version: str,
+) -> bool:
+    cursor = await db.execute(
+        """UPDATE signal_outcomes
+           SET hit_configured=?, stopped=?, first_event=?,
+               finalized=1, finalized_at=?, label_source='realized_campaign',
+               label_version=?, outcome_source_id=?
+           WHERE signal_id=?
+             AND (outcome_source_id IS NULL OR outcome_source_id=?)""",
+        (
+            1 if hit else 0,
+            0 if hit else 1,
+            "CAMPAIGN_HIT" if hit else "CAMPAIGN_MISS",
+            time.time(),
+            label_version,
+            outcome_source_id,
+            signal_id,
+            outcome_source_id,
+        ),
+    )
+    return int(getattr(cursor, "rowcount", 0) or 0) > 0
 
 
 async def record_trade_outcome(
@@ -441,7 +497,9 @@ async def record_trade_outcome(
     volume_ratio: float = 1.0, btc_regime: str = "NEUTRAL",
     rsi: float = 50.0, ema_cross: str = "FLAT",
     pnl_usdt: float = 0.0, slippage_bps: float = 0.0,
-    fee_paid_usdt: float = 0.0
+    fee_paid_usdt: float = 0.0,
+    signal_id: str | None = None,
+    label_version: str = "campaign-pnl-v1",
 ) -> bool:
     """Registra outcome de trade com métricas avançadas."""
     win = 1 if pnl_pct > 0 else 0
@@ -464,8 +522,12 @@ async def record_trade_outcome(
                      volume_ratio, btc_regime, rsi, ema_cross,
                      slippage_bps, fee_paid_usdt, time.time(), source_id)
                 )
+                if signal_id:
+                    await _reconcile_signal_outcome_on_db(
+                        db, signal_id, source_id, pnl_usdt > 0, label_version
+                    )
                 await db.commit()
-                return True
+                return False
 
         cursor = await db.execute(
             """INSERT INTO trade_outcomes
@@ -482,8 +544,137 @@ async def record_trade_outcome(
             return False
         await _update_hourly_metrics(db, symbol, side, pnl_pct, win)
         await _update_daily_metrics(db, symbol, side, pnl_pct, win)
+        if signal_id and source_id:
+            await _reconcile_signal_outcome_on_db(
+                db, signal_id, source_id, pnl_usdt > 0, label_version
+            )
         await db.commit()
         return True
+
+
+async def record_trade_outcomes_batch(outcomes: list[dict]) -> list[bool]:
+    """Write an idempotent outcome batch with one connection and one commit."""
+    results: list[bool] = []
+    reconciliations: list[tuple[str, str, bool, str]] = []
+    async with connect(DB_PATH) as db:
+        for outcome in outcomes:
+            source_id = outcome.get("source_id")
+            symbol = str(outcome["symbol"])
+            side = str(outcome["side"])
+            pnl_pct = float(outcome.get("pnl_pct", 0))
+            pnl_usdt = float(outcome.get("pnl_usdt", 0))
+            win = 1 if pnl_pct > 0 else 0
+
+            if source_id:
+                existing = await (await db.execute(
+                    "SELECT id FROM trade_outcomes WHERE source_id=?",
+                    (source_id,),
+                )).fetchone()
+                if existing:
+                    await db.execute(
+                        """UPDATE trade_outcomes
+                           SET source=?, is_demo=?, symbol=?, side=?, entry_price=?, exit_price=?,
+                               pnl_pct=?, pnl_usdt=?, win=?, oi_at_entry=?, funding_at_entry=?,
+                               volume_ratio=?, btc_regime=?, rsi_at_entry=?, ema_cross=?,
+                               slippage_bps=?, fee_paid_usdt=?, timestamp=?
+                           WHERE source_id=?""",
+                        (
+                            outcome.get("source", "manual"),
+                            1 if outcome.get("is_demo", False) else 0,
+                            symbol,
+                            side,
+                            float(outcome.get("entry_price", 0)),
+                            float(outcome.get("exit_price", 0)),
+                            pnl_pct,
+                            pnl_usdt,
+                            win,
+                            float(outcome.get("oi_change", 0)),
+                            float(outcome.get("funding", 0)),
+                            float(outcome.get("volume_ratio", 1)),
+                            outcome.get("btc_regime", "NEUTRAL"),
+                            float(outcome.get("rsi", 50)),
+                            outcome.get("ema_cross", "FLAT"),
+                            float(outcome.get("slippage_bps", 0)),
+                            float(outcome.get("fee_paid_usdt", 0)),
+                            time.time(),
+                            source_id,
+                        ),
+                    )
+                    results.append(True)
+                    signal_id = outcome.get("signal_id")
+                    if signal_id:
+                        reconciliations.append((
+                            str(signal_id),
+                            str(source_id),
+                            pnl_usdt > 0,
+                            str(outcome.get("label_version", "campaign-pnl-v1")),
+                        ))
+                    continue
+
+            cursor = await db.execute(
+                """INSERT INTO trade_outcomes
+                   (source_id, source, is_demo, symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
+                    oi_at_entry, funding_at_entry, volume_ratio, btc_regime,
+                    rsi_at_entry, ema_cross, slippage_bps, fee_paid_usdt, timestamp)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(source_id) DO NOTHING""",
+                (
+                    source_id,
+                    outcome.get("source", "manual"),
+                    1 if outcome.get("is_demo", False) else 0,
+                    symbol,
+                    side,
+                    float(outcome.get("entry_price", 0)),
+                    float(outcome.get("exit_price", 0)),
+                    pnl_pct,
+                    pnl_usdt,
+                    win,
+                    float(outcome.get("oi_change", 0)),
+                    float(outcome.get("funding", 0)),
+                    float(outcome.get("volume_ratio", 1)),
+                    outcome.get("btc_regime", "NEUTRAL"),
+                    float(outcome.get("rsi", 50)),
+                    outcome.get("ema_cross", "FLAT"),
+                    float(outcome.get("slippage_bps", 0)),
+                    float(outcome.get("fee_paid_usdt", 0)),
+                    time.time(),
+                ),
+            )
+            inserted = not source_id or int(getattr(cursor, "rowcount", 0) or 0) > 0
+            results.append(inserted)
+            if inserted:
+                await _update_hourly_metrics(db, symbol, side, pnl_pct, win)
+                await _update_daily_metrics(db, symbol, side, pnl_pct, win)
+                signal_id = outcome.get("signal_id")
+                if signal_id and source_id:
+                    reconciliations.append((
+                        str(signal_id),
+                        str(source_id),
+                        pnl_usdt > 0,
+                        str(outcome.get("label_version", "campaign-pnl-v1")),
+                    ))
+        await db.commit()
+
+    for signal_id, source_id, hit, label_version in reconciliations:
+        await reconcile_signal_outcome(signal_id, source_id, hit, label_version)
+    return results
+
+
+async def reconcile_signal_outcome(
+    signal_id: str,
+    outcome_source_id: str,
+    hit: bool,
+    label_version: str = "campaign-pnl-v1",
+) -> bool:
+    """Attach one realized campaign label to one entry-time observation."""
+    if not signal_id or not outcome_source_id:
+        return False
+    async with connect(DB_PATH) as db:
+        reconciled = await _reconcile_signal_outcome_on_db(
+            db, signal_id, outcome_source_id, hit, label_version
+        )
+        await db.commit()
+        return reconciled
 
 
 async def _update_hourly_metrics(db: Any, symbol: str, side: str, pnl_pct: float, win: int):
@@ -533,17 +724,20 @@ async def _update_daily_metrics(db: Any, symbol: str, side: str, pnl_pct: float,
 
 
 async def save_feature_snapshot(symbol: str, features: dict):
-    """Salva snapshot de features com campos avançados."""
+    """Salva snapshot de features com campos avançados, incluindo bid/ask para
+    que o fallback de sinal_learning possa reconstruir preços executáveis."""
     async with connect(DB_PATH) as db:
         await db.execute(
             """INSERT INTO feature_snapshots
-               (symbol, timestamp, price, price_change_pct, volume_ratio,
+               (symbol, timestamp, price, bid, ask, price_change_pct, volume_ratio,
                 oi_change_pct, funding_rate, rsi, ema_cross, atr_pct,
                 spread_bps, btc_regime, bid_depth_5, ask_depth_5, book_imbalance, cvd)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                symbol, time.time(),
+                symbol, float(features.get("timestamp") or time.time()),
                 features.get("price", 0),
+                features.get("bid") or features.get("price", 0),
+                features.get("ask") or features.get("price", 0),
                 features.get("price_change_pct", 0),
                 features.get("volume_ratio", 1),
                 features.get("oi_change_pct", 0),
@@ -577,6 +771,7 @@ async def record_signal_decision(
     entry_price: float,
     estimated_cost_pct: float,
     target_moves: dict[str, float],
+    feature_version: str = "legacy",
 ) -> bool:
     if entry_price <= 0:
         return False
@@ -589,8 +784,8 @@ async def record_signal_decision(
                     entry_price, estimated_cost_pct,
                     target_configured_move_pct, target_050_move_pct,
                     target_100_move_pct, target_200_move_pct,
-                    created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    feature_version, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     signal_id,
                     symbol,
@@ -609,6 +804,7 @@ async def record_signal_decision(
                     float(target_moves.get("0.5", 0)),
                     float(target_moves.get("1.0", 0)),
                     float(target_moves.get("2.0", 0)),
+                    feature_version,
                     time.time(),
                 ),
             )
@@ -655,8 +851,9 @@ async def finalize_signal_outcome(
                    hit_configured=?, hit_050=?, hit_100=?, hit_200=?, stopped=?,
                    first_event=?, first_event_seconds=?,
                    max_favorable_pct=?, max_adverse_pct=?,
-                   finalized=1, finalized_at=?
-               WHERE signal_id=?""",
+                   finalized=1, finalized_at=?, label_source='price_window',
+                   label_version='price-window-v1'
+               WHERE signal_id=? AND outcome_source_id IS NULL""",
             (
                 prices.get("30"),
                 prices.get("60"),
@@ -672,6 +869,29 @@ async def finalize_signal_outcome(
                 max_favorable_pct,
                 max_adverse_pct,
                 time.time(),
+                signal_id,
+            ),
+        )
+        await db.commit()
+
+
+async def record_signal_prediction(
+    signal_id: str,
+    probability: float | None,
+    prediction_timestamp: float,
+    model_version: str | None,
+) -> None:
+    if probability is None:
+        return
+    async with connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE signal_outcomes
+               SET predicted_probability=?, prediction_timestamp=?, model_version=?
+               WHERE signal_id=?""",
+            (
+                max(0.0, min(1.0, float(probability))),
+                float(prediction_timestamp),
+                model_version,
                 signal_id,
             ),
         )
@@ -749,11 +969,15 @@ async def get_signal_training_rows(
             f"""SELECT signal_id, symbol, side, decision, decision_group,
                       context_key, features,
                       target_configured_move_pct, estimated_cost_pct, hit_configured,
-                      stopped, first_event, created_at
+                      stopped, first_event, created_at, finalized_at,
+                      strategy_version, config_hash, feature_version,
+                      label_version, label_source, outcome_source_id
                FROM signal_outcomes
                WHERE finalized=1
                  {source_filter}
                  AND hit_configured IS NOT NULL
+                 AND finalized_at IS NOT NULL
+                 AND finalized_at >= created_at
                  {decision_filter}
                ORDER BY created_at ASC
                LIMIT ?""",
@@ -765,6 +989,23 @@ async def get_signal_training_rows(
         item["features"] = json.loads(item["features"])
         result.append(item)
     return result
+
+
+def signal_dataset_fingerprint(rows: list[dict]) -> str:
+    canonical = [
+        {
+            "signal_id": row.get("signal_id"),
+            "created_at": row.get("created_at"),
+            "finalized_at": row.get("finalized_at"),
+            "feature_version": row.get("feature_version"),
+            "label_version": row.get("label_version"),
+            "label": row.get("hit_configured"),
+            "features": row.get("features"),
+        }
+        for row in rows
+    ]
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 async def get_signal_training_summary(
@@ -830,6 +1071,60 @@ async def get_signal_pipeline_summary() -> dict:
     }
 
 
+async def get_signal_readiness_diagnostics(
+    min_samples: int = 300,
+    source_type: str | None = None,
+) -> dict:
+    rows = await get_signal_training_rows(source_type=source_type)
+    now = time.time()
+    stale_after = max(OUTCOME_STALE_SECONDS, 600)
+    async with connect(DB_PATH) as db:
+        unresolved = await (await db.execute(
+            """SELECT COUNT(*), MIN(created_at)
+               FROM signal_outcomes
+               WHERE finalized=0 AND created_at <= ?""",
+            (now - stale_after,),
+        )).fetchone()
+        invalid = await (await db.execute(
+            """SELECT COUNT(*) FROM signal_outcomes
+               WHERE finalized=1 AND (
+                   hit_configured IS NULL OR finalized_at IS NULL OR finalized_at < created_at
+               )"""
+        )).fetchone()
+
+    hits = sum(1 for row in rows if int(row.get("hit_configured") or 0) == 1)
+    misses = len(rows) - hits
+    minority = min(hits, misses)
+    ratio = minority / len(rows) if rows else 0.0
+    if len(rows) < min_samples:
+        state = "COLLECTING"
+    elif hits == 0 or misses == 0:
+        state = "LABEL_BLOCKED"
+    elif ratio < 0.10:
+        state = "CLASS_IMBALANCED"
+    else:
+        state = "READY_TO_TRAIN"
+
+    versions: dict[str, int] = {}
+    for row in rows:
+        key = f"{row.get('feature_version', 'legacy')}|{row.get('label_version', 'legacy')}"
+        versions[key] = versions.get(key, 0) + 1
+
+    return {
+        "state": state,
+        "minSamples": min_samples,
+        "samples": len(rows),
+        "hits": hits,
+        "misses": misses,
+        "minorityClassRatio": round(ratio, 4),
+        "stalePending": int((unresolved or (0,))[0] or 0),
+        "oldestStalePendingAt": float((unresolved or (0, 0))[1] or 0),
+        "invalidOrLeakyLabels": int((invalid or (0,))[0] or 0),
+        "datasetFingerprint": signal_dataset_fingerprint(rows),
+        "versions": versions,
+    }
+
+
 async def get_recent_signal_outcomes(limit: int = 20, source_type: str | None = None) -> list[dict]:
     params: list[Any] = []
     source_filter = ""
@@ -848,6 +1143,69 @@ async def get_recent_signal_outcomes(limit: int = 20, source_type: str | None = 
                ORDER BY created_at DESC
                LIMIT ?""",
             params,
+        )).fetchall()
+    return [dict(row) for row in rows]
+
+
+async def get_drift_signal_rows(limit: int = 5000) -> list[dict]:
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
+        rows = await (await db.execute(
+            """SELECT signal_id, symbol, side, source_type, strategy_version,
+                      features, target_configured_move_pct, estimated_cost_pct,
+                      hit_configured, stopped, first_event, max_adverse_pct,
+                      created_at, finalized_at,
+                      predicted_probability, prediction_timestamp, model_version
+               FROM signal_outcomes
+               WHERE predicted_probability IS NOT NULL
+               ORDER BY created_at ASC
+               LIMIT ?""",
+            (limit,),
+        )).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["features"] = json.loads(item["features"])
+        result.append(item)
+    return result
+
+
+async def get_calibration_audit_rows(limit: int = 50000) -> list[dict]:
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
+        rows = await (await db.execute(
+            """SELECT signal_id, symbol, side, source_type, strategy_version,
+                      features, target_configured_move_pct, estimated_cost_pct,
+                      hit_configured, stopped, first_event, max_adverse_pct,
+                      created_at, finalized_at,
+                      predicted_probability, prediction_timestamp, model_version
+               FROM signal_outcomes
+               WHERE finalized=1
+                 AND hit_configured IS NOT NULL
+                 AND finalized_at IS NOT NULL
+                 AND finalized_at >= created_at
+               ORDER BY created_at ASC
+               LIMIT ?""",
+            (limit,),
+        )).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["features"] = json.loads(item["features"])
+        result.append(item)
+    return result
+
+
+async def get_drift_trade_rows(limit: int = 5000) -> list[dict]:
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
+        rows = await (await db.execute(
+            """SELECT source_id, symbol, side, pnl_pct, pnl_usdt, win,
+                      btc_regime, timestamp
+               FROM trade_outcomes
+               ORDER BY timestamp ASC
+               LIMIT ?""",
+            (limit,),
         )).fetchall()
     return [dict(row) for row in rows]
 
@@ -1307,6 +1665,12 @@ async def get_recent_insights(limit: int = 5) -> list[dict]:
 
 
 async def get_feature_history(symbol: str, hours: int = 24) -> list[dict]:
+    """Return feature snapshot history compatible with signal_learning price lookups.
+
+    Each returned dict is guaranteed to have ``price``, ``bid``, and ``ask`` fields
+    so that ``_nearest_price`` and ``_executable_price`` work correctly even when
+    the DB rows pre-date the bid/ask columns.
+    """
     since = time.time() - hours * 3600
     async with connect(DB_PATH) as db:
         db.row_factory = Row
@@ -1316,7 +1680,18 @@ async def get_feature_history(symbol: str, hours: int = 24) -> list[dict]:
                ORDER BY timestamp ASC""",
             (symbol, since)
         )).fetchall()
-        return [dict(r) for r in rows]
+        result = []
+        for r in rows:
+            d = dict(r)
+            # Guarantee bid/ask presence for _executable_price fallback.
+            # bid/ask columns were added via migration; older rows may be NULL.
+            price = float(d.get("price") or 0)
+            if not d.get("bid"):
+                d["bid"] = price
+            if not d.get("ask"):
+                d["ask"] = price
+            result.append(d)
+        return result
 
 
 async def get_recent_observations(symbol: str = None, hours: int = 48, limit: int = 50) -> list[dict]:

@@ -1058,6 +1058,7 @@ async def reconcile_signal_outcome(signal_id: str, outcome_source_id: str, won: 
                    outcome_source_id=COALESCE(NULLIF(outcome_source_id, ''), ?),
                    label_version=COALESCE(label_version, 'campaign-pnl-v1')
                WHERE signal_id=?
+                 AND source_type='vst_campaign'
                  AND (outcome_source_id IS NULL OR outcome_source_id='' OR outcome_source_id=?)""",
             (1 if won else 0, now, outcome_source_id, signal_id, outcome_source_id),
         )
@@ -1464,12 +1465,18 @@ async def get_sniper_reconciliation_status(days: int = 30, limit: int = 10000) -
     net_ev_sum = 0.0
     live_shadow_delta_sum = 0.0
     recent: list[dict] = []
+    seen_market_events: set[str] = set()
 
     for row in signals:
         signal = dict(row)
-        counts["totalDecisions"] += 1
         signal_id = str(signal.get("signal_id") or "")
         market_event_id = str(signal.get("market_event_id") or "")
+        if market_event_id:
+            dedupe_key = f"{market_event_id}|{signal.get('side')}|{signal.get('source_type')}"
+            if dedupe_key in seen_market_events:
+                continue
+            seen_market_events.add(dedupe_key)
+        counts["totalDecisions"] += 1
         trade = trades_by_signal.get(signal_id) or trades_by_event.get(market_event_id)
         executed = trade is not None
         would_win = bool(signal.get("hit_configured"))

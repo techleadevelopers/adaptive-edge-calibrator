@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -23,6 +25,21 @@ IntegrityError = (
 _SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _postgres_pool = None
 _postgres_pool_url: Optional[str] = None
+_db_stats = {
+    "acquires": 0,
+    "acquire_failures": 0,
+    "active": 0,
+    "peak_active": 0,
+}
+_db_acquire_ms: deque[float] = deque(maxlen=2048)
+
+
+def _percentile(values: deque[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int((len(ordered) - 1) * percentile)))
+    return round(ordered[index], 2)
 
 
 def database_url() -> Optional[str]:
@@ -112,12 +129,22 @@ class PostgresConnection:
 
     async def __aenter__(self):
         self._pool = await _get_postgres_pool()
-        self._connection = await self._pool.acquire()
+        started = time.perf_counter()
+        try:
+            self._connection = await self._pool.acquire()
+        except Exception:
+            _db_stats["acquire_failures"] += 1
+            raise
+        _db_acquire_ms.append((time.perf_counter() - started) * 1000)
+        _db_stats["acquires"] += 1
+        _db_stats["active"] += 1
+        _db_stats["peak_active"] = max(_db_stats["peak_active"], _db_stats["active"])
         return self
 
     async def __aexit__(self, exc_type, exc, traceback):
         if self._connection is not None and self._pool is not None:
             await self._pool.release(self._connection)
+            _db_stats["active"] = max(0, _db_stats["active"] - 1)
         self._connection = None
 
     async def execute(self, query: str, params: Iterable[Any] = ()):
@@ -171,3 +198,27 @@ async def close_pool():
         await _postgres_pool.close()
     _postgres_pool = None
     _postgres_pool_url = None
+
+
+def database_pool_status() -> dict[str, Any]:
+    status = {
+        "backend": "postgresql" if using_postgres() else "sqlite",
+        "configured": bool(_postgres_pool is not None) if using_postgres() else True,
+        "acquires": _db_stats["acquires"],
+        "acquireFailures": _db_stats["acquire_failures"],
+        "active": _db_stats["active"],
+        "peakActive": _db_stats["peak_active"],
+        "acquireLatencyMs": {
+            "p50": _percentile(_db_acquire_ms, 0.50),
+            "p95": _percentile(_db_acquire_ms, 0.95),
+            "p99": _percentile(_db_acquire_ms, 0.99),
+        },
+    }
+    if _postgres_pool is not None:
+        status.update({
+            "size": _postgres_pool.get_size(),
+            "idle": _postgres_pool.get_idle_size(),
+            "minSize": _postgres_pool.get_min_size(),
+            "maxSize": _postgres_pool.get_max_size(),
+        })
+    return status

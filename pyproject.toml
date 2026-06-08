@@ -18,3 +18,12 @@ dependencies = [
 
 [project.scripts]
 quant-brain = "main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+    ".tmp",
+    "__pycache__",
+    "tmp*",
+]
+addopts = "-p no:cacheprovider"

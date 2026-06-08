@@ -274,9 +274,6 @@ async def record_signal_from_gate(
     fallback_side: str,
     sniper: dict[str, Any],
     config: dict[str, Any],
-    signal_id: str | None = None,
-    feature_version: str = "sniper-v2",
-    source_type: str | None = None,
 ) -> dict[str, Any]:
     """Registra decisão do gate para aprendizado posterior."""
     alt = MovementFeatures(**sniper["altFeatures"])
@@ -315,13 +312,9 @@ async def record_signal_from_gate(
         ),
     )
     created_bucket = int(time.time() // dedupe_seconds)
-    signal_id = signal_id or _signal_id(
-        symbol, side, str(sniper.get("decision", "")), created_bucket, context_key
-    )
+    signal_id = _signal_id(symbol, side, str(sniper.get("decision", "")), created_bucket, context_key)
     decision = str(sniper.get("decision", "WAIT"))
-    source_type = str(
-        source_type or config.get("signalSourceType", "hypothetical")
-    ).lower()
+    source_type = str(config.get("signalSourceType", "hypothetical")).lower()
 
     features = {
         "alt": sniper.get("altFeatures", {}),
@@ -353,7 +346,6 @@ async def record_signal_from_gate(
         entry_price=entry_price,
         estimated_cost_pct=estimated_cost_pct,
         target_moves=target_moves,
-        feature_version=feature_version,
     )
 
     return {

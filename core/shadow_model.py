@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import json
-import asyncio
 import time
 import math
 import os
-import hashlib
 from pathlib import Path
 from typing import Any
 from collections import defaultdict
@@ -439,48 +437,19 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
 
     source_filter = os.environ.get("SHADOW_MODEL_SIGNAL_SOURCE_TYPE", "").strip() or None
     rows = await kb.get_signal_training_rows(decision_group=None, source_type=source_filter)
-    readiness = await kb.get_signal_readiness_diagnostics(
-        min_samples=min_samples,
-        source_type=source_filter,
-    )
     if len(rows) < min_samples:
         return {
             "trained": False,
             "reason": "insufficient_samples",
             "samples": len(rows),
             "minSamples": min_samples,
-            "readiness": readiness,
-        }
-
-    if readiness["state"] in {"LABEL_BLOCKED", "CLASS_IMBALANCED"}:
-        return {
-            "trained": False,
-            "reason": readiness["state"].lower(),
-            "samples": len(rows),
-            "readiness": readiness,
-        }
-
-    raw_split = max(int(len(rows) * 0.8), 1)
-    test_rows = rows[raw_split:]
-    test_start = float(test_rows[0]["created_at"]) if test_rows else float("inf")
-    train_rows = [
-        row for row in rows[:raw_split]
-        if float(row.get("finalized_at") or 0) <= test_start
-    ]
-    rows = train_rows + test_rows
-    split = len(train_rows)
-    if split < 50 or len(test_rows) < 20:
-        return {
-            "trained": False,
-            "reason": "insufficient_purged_chronological_split",
-            "samples": len(rows),
-            "purgedTrainSamples": split,
         }
 
     x = [_feature_dict(row) for row in rows]
     y = np.asarray([int(row.get("hit_configured") or 0) for row in rows])
 
     # Divisão temporal (não aleatória)
+    split = max(int(len(rows) * 0.8), 1)
     if len(set(y[:split])) < 2 or len(set(y[split:])) < 2:
         return {"trained": False, "reason": "both_classes_required", "samples": len(rows)}
 
@@ -528,17 +497,11 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
         gb_model = build_gb_model()
         rf_model = build_rf_model()
 
-        await asyncio.gather(
-            asyncio.to_thread(gb_model.fit, x[:train_end], fold_y),
-            asyncio.to_thread(rf_model.fit, x[:train_end], fold_y),
-        )
+        gb_model.fit(x[:train_end], fold_y)
+        rf_model.fit(x[:train_end], fold_y)
 
-        gb_proba, rf_proba = await asyncio.gather(
-            asyncio.to_thread(gb_model.predict_proba, x[train_end:validation_end]),
-            asyncio.to_thread(rf_model.predict_proba, x[train_end:validation_end]),
-        )
-        gb_proba = gb_proba[:, 1]
-        rf_proba = rf_proba[:, 1]
+        gb_proba = gb_model.predict_proba(x[train_end:validation_end])[:, 1]
+        rf_proba = rf_model.predict_proba(x[train_end:validation_end])[:, 1]
 
         # Ensemble simples (média)
         ensemble_proba = (gb_proba + rf_proba) / 2
@@ -551,24 +514,18 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
 
     # Calibração isotônica
     calibrator = IsotonicRegression(out_of_bounds="clip")
-    await asyncio.to_thread(calibrator.fit, oof_probabilities, oof_labels)
+    calibrator.fit(oof_probabilities, oof_labels)
 
     # Treina modelo final com ensemble
     gb_final = build_gb_model()
     rf_final = build_rf_model()
 
-    await asyncio.gather(
-        asyncio.to_thread(gb_final.fit, x[:split], y[:split]),
-        asyncio.to_thread(rf_final.fit, x[:split], y[:split]),
-    )
+    gb_final.fit(x[:split], y[:split])
+    rf_final.fit(x[:split], y[:split])
 
     # Avaliação no test set
-    gb_test, rf_test = await asyncio.gather(
-        asyncio.to_thread(gb_final.predict_proba, x[split:]),
-        asyncio.to_thread(rf_final.predict_proba, x[split:]),
-    )
-    gb_test = gb_test[:, 1]
-    rf_test = rf_test[:, 1]
+    gb_test = gb_final.predict_proba(x[split:])[:, 1]
+    rf_test = rf_final.predict_proba(x[split:])[:, 1]
     ensemble_test = (gb_test + rf_test) / 2
     calibrated_test = calibrator.predict(ensemble_test)
 
@@ -582,29 +539,21 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
     improves_baseline = model_brier < baseline_brier
 
     # Validação cruzada temporal
-    cv_results = await asyncio.to_thread(_cross_validate_temporal, x, y)
+    cv_results = _cross_validate_temporal(x, y)
 
     # Feature importance
-    feature_importance = await asyncio.to_thread(
-        _calculate_feature_importance,
-        gb_final,
-        gb_final.named_steps["vectorizer"],
-        NUMERICAL_FEATURES,
-    )
+    feature_importance = _calculate_feature_importance(gb_final, gb_final.named_steps["vectorizer"], NUMERICAL_FEATURES)
     _feature_importance_cache.update(feature_importance)
 
     # ── Testes essenciais de lucratividade ──────────────────────────────────
     # Simula edge financeiro: encontra threshold que maximiza EV por trade,
     # valida se o modelo supera o breakeven da configuração scalp.
-    profitability, data_quality = await asyncio.gather(
-        asyncio.to_thread(
-            _profitability_simulation,
-            rows[split:],
-            list(calibrated_test.tolist()),
-            list(y[split:].tolist()),
-        ),
-        asyncio.to_thread(_data_quality_report, rows),
+    profitability = _profitability_simulation(
+        rows[split:],
+        list(calibrated_test.tolist()),
+        list(y[split:].tolist()),
     )
+    data_quality = _data_quality_report(rows)
     # ────────────────────────────────────────────────────────────────────────
 
     metadata = {
@@ -634,10 +583,6 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
         "profitabilityThresholdScan": profitability.get("thresholdScan", []),
         # Data quality
         "dataQuality": data_quality,
-        "datasetFingerprint": kb.signal_dataset_fingerprint(rows),
-        "featureLabelVersions": readiness["versions"],
-        "labelAvailabilityPurged": raw_split - split,
-        "validation": "purged_chronological_holdout_with_walk_forward",
     }
 
     save_model = improves_baseline or profitability["profitabilityVerified"]
@@ -650,64 +595,7 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
             "model_type": "ensemble",
         }
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(joblib.dump, final_model, MODEL_PATH)
-        try:
-            from core.model_governance import (
-                CandidateSpec,
-                GovernanceStore,
-                VersionSet,
-            )
-
-            governance_store = GovernanceStore(Path(os.environ.get(
-                "MODEL_GOVERNANCE_DIR",
-                str(Path(__file__).parent.parent / "data" / "governance"),
-            )))
-            artifact_content = MODEL_PATH.read_bytes()
-            artifact_sha256 = governance_store.put_artifact(
-                artifact_content,
-                {"format": "joblib", "model_type": "shadow_ensemble"},
-            )
-            feature_versions = sorted({
-                str(row.get("feature_version") or "legacy") for row in rows
-            })
-            label_versions = sorted({
-                str(row.get("label_version") or "legacy") for row in rows
-            })
-            feature_version = (
-                feature_versions[0]
-                if len(feature_versions) == 1
-                else f"mixed-{hashlib.sha256('|'.join(feature_versions).encode()).hexdigest()[:12]}"
-            )
-            label_version = (
-                label_versions[0]
-                if len(label_versions) == 1
-                else f"mixed-{hashlib.sha256('|'.join(label_versions).encode()).hexdigest()[:12]}"
-            )
-            registry = governance_store.status()
-            candidate_id = f"ml-challenger-{artifact_sha256[:16]}"
-            candidate = governance_store.register(CandidateSpec(
-                candidate_id=candidate_id,
-                kind="ml_challenger",
-                versions=VersionSet(
-                    feature=feature_version,
-                    label=label_version,
-                    policy=f"shadow-threshold-{profitability['optimalThreshold']:.2f}",
-                ),
-                artifact_sha256=artifact_sha256,
-                created_at=metadata["trainedAt"],
-                parent_candidate_id=registry.get("champion_id"),
-                metadata={
-                    "samples": len(rows),
-                    "walkForward": True,
-                    "authority": "shadow",
-                },
-            ))
-            metadata["governanceCandidateId"] = candidate.candidate_id
-            metadata["artifactSha256"] = artifact_sha256
-        except Exception as exc:
-            metadata["governanceRegistrationError"] = (
-                f"{type(exc).__name__}: {exc}"
-            )
+        joblib.dump(final_model, MODEL_PATH)
         METADATA_PATH.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         await kb.save_model_artifact(
             "sniper_target_050",
@@ -848,11 +736,7 @@ def predict_shadow(row: dict[str, Any]) -> dict[str, Any]:
                 meta_raw = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
                 trained_at = int(meta_raw.get("trainedAt", 0))
                 if trained_at:
-                    fingerprint = str(meta_raw.get("datasetFingerprint") or "")[:12]
-                    model_version = (
-                        f"shadow-{trained_at}-{fingerprint}"
-                        if fingerprint else f"shadow-{trained_at}"
-                    )
+                    model_version = f"shadow-{trained_at}"
             except Exception:
                 pass
 

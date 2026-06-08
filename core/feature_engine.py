@@ -17,7 +17,6 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 import httpx
-from core.market_data_quality import SnapshotTracker, sanitize_candles
 
 BINGX_BASE = "https://open-api.bingx.com"
 HTTP_CONCURRENCY = max(1, int(os.environ.get("FEATURE_HTTP_CONCURRENCY", "8")))
@@ -65,16 +64,14 @@ class MarketSnapshot:
     latency_ms: float = 0.0        # latência da requisição
     data_quality_score: float = 1.0  # 0-1
     price_confidence: float = 1.0  # 0-1 baseado em profundidade
-    source_timestamp: float = 0.0
-    market_event_id: str = ""
-    freshness_seconds: float = 0.0
-    data_quality_incidents: list[str] = field(default_factory=list)
 
 
 class FeatureEngine:
     def __init__(self):
         self._client: Optional[httpx.AsyncClient] = None
         self._prev_oi: dict[str, float] = {}
+        self._prev_volume_24h: dict[str, float] = {}
+        self._volume_increment_history: dict[str, deque] = {s: deque(maxlen=60) for s in SYMBOLS}
         self._prev_prices: dict[str, list[float]] = {s: [] for s in SYMBOLS}
         self._snapshots: dict[str, MarketSnapshot] = {}
         self._btc_change = 0.0
@@ -92,9 +89,6 @@ class FeatureEngine:
         self._websocket_connected: bool = False
         self._http_semaphore = asyncio.Semaphore(HTTP_CONCURRENCY)
         self._snapshot_semaphore = asyncio.Semaphore(SNAPSHOT_CONCURRENCY)
-        self._snapshot_tracker = SnapshotTracker(
-            expected_interval_seconds=max(5.0, float(os.environ.get("TACTICAL_LOOP_SECONDS", "15")))
-        )
 
     def on_snapshot(self, fn):
         self._callbacks.append(fn)
@@ -169,8 +163,7 @@ class FeatureEngine:
         data = r.get("data", [])
         if not isinstance(data, list):
             return []
-        quality = sanitize_candles(symbol, interval, [item for item in data if isinstance(item, dict)])
-        return quality["completed"]
+        return [item for item in data if isinstance(item, dict)]
 
     async def fetch_orderbook(self, symbol: str, depth: int = 10) -> tuple[float, float, float, float, float, float]:
         """
@@ -501,20 +494,25 @@ class FeatureEngine:
             volume_24h = float(ticker.get("volume", 0))
             high_24h = float(ticker.get("highPrice", price))
             low_24h = float(ticker.get("lowPrice", price))
-            avg_vol = float(ticker.get("quoteVolume", volume_24h)) / 24 if volume_24h > 0 else 1
-            volume_ratio = volume_24h / avg_vol if avg_vol > 0 else 1.0
+
+            # Volume ratio: use short-term increment history (recent candle-style)
+            # rather than dividing 24h volume by 24 — gives a real scalp-relevant signal.
+            prev_vol_24h = self._prev_volume_24h.get(symbol, 0.0)
+            if prev_vol_24h > 0 and volume_24h >= prev_vol_24h:
+                vol_increment = volume_24h - prev_vol_24h
+                self._volume_increment_history[symbol].append(vol_increment)
+            self._prev_volume_24h[symbol] = volume_24h
+
+            increment_history = list(self._volume_increment_history[symbol])
+            if len(increment_history) >= 3:
+                avg_increment = sum(increment_history[:-1]) / max(len(increment_history) - 1, 1)
+                current_increment = increment_history[-1]
+                volume_ratio = current_increment / avg_increment if avg_increment > 0 else 1.0
+            else:
+                # Fallback: use 24h average (initial state before history builds up)
+                avg_vol = float(ticker.get("quoteVolume", volume_24h)) / 24 if volume_24h > 0 else 1
+                volume_ratio = volume_24h / avg_vol if avg_vol > 0 else 1.0
         except Exception:
-            return None
-        received_at = time.time()
-        raw_source_ts = ticker.get("time", ticker.get("timestamp", received_at))
-        try:
-            source_timestamp = float(raw_source_ts)
-            if source_timestamp > 10_000_000_000:
-                source_timestamp /= 1000
-        except (TypeError, ValueError):
-            source_timestamp = received_at
-        snapshot_quality = self._snapshot_tracker.accept(symbol, source_timestamp, received_at)
-        if not snapshot_quality.accepted:
             return None
 
         # Spreads
@@ -627,16 +625,6 @@ class FeatureEngine:
             latency_ms=latency_ms,
             data_quality_score=data_quality_score,
             price_confidence=price_confidence,
-            source_timestamp=source_timestamp,
-            market_event_id=f"md:v1:bingx:{symbol}:snapshot:{int(source_timestamp * 1000)}",
-            freshness_seconds=snapshot_quality.freshness_seconds,
-            data_quality_incidents=[
-                name for name, active in (
-                    ("GAP", snapshot_quality.gap_seconds > self._snapshot_tracker.expected_interval_seconds * 2),
-                    ("RECOVERED", snapshot_quality.recovered),
-                    ("STALE", snapshot_quality.freshness_seconds > self._snapshot_tracker.expected_interval_seconds * 2),
-                ) if active
-            ],
         )
 
         snap.anomalies = self._detect_anomalies(snap)
@@ -712,10 +700,6 @@ class FeatureEngine:
             "latency_ms": snap.latency_ms,
             "data_quality_score": snap.data_quality_score,
             "price_confidence": snap.price_confidence,
-            "source_timestamp": snap.source_timestamp,
-            "market_event_id": snap.market_event_id,
-            "freshness_seconds": snap.freshness_seconds,
-            "data_quality_incidents": snap.data_quality_incidents,
         }
 
     async def close(self):

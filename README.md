@@ -641,6 +641,45 @@ python -m pytest
 A suíte cobre contrato, lifecycle shadow, qualidade de mercado, drift,
 governança, job supervisor, banco, calibração e regressões de runtime.
 
+### Estado Atual Da Validação
+
+Validações focadas que passaram no estado atual do workspace:
+
+- `python -m py_compile core\knowledge_base.py core\signal_learning.py core\edge_gate.py api\server.py`
+- `python -m py_compile api\kb_trades.py api\server.py tests\test_contract.py`
+- testes focados de mapper/regressão do contrato `/kb/trades`: `3 passed`
+- `python -m pytest -q tests/test_sniper_reconciliation.py tests/test_shadow_lifecycle.py -p no:cacheprovider`: `10 passed`
+- `python -m pytest -q tests/test_contract.py::TestKbTradeContract`: `7 passed`
+
+Validações com bloqueios conhecidos:
+
+- `python -m pytest` a partir da raiz do repositório pode falhar na coleta por
+  diretórios temporários `pytest-cache-files-*` sem permissão. Rode a suíte a
+  partir de `quant-brain` ou ignore esses diretórios.
+- Depois de ignorar os diretórios temporários, a coleta completa ainda pode
+  falhar quando dependências opcionais não estão instaladas, como `sklearn`.
+- O Python 3.7 ativo em alguns ambientes quebra testes que usam sintaxe/tipos
+  mais novos, por exemplo `Callable[...]` em `test_job_supervisor_load.py`.
+  Preferir Python compatível com o conjunto atual de testes e dependências.
+- Algumas baterias longas de pytest podem estourar timeout sem falha de
+  assertion visível; nesse caso, valide primeiro os testes focados do contrato,
+  reconciliation, shadow lifecycle e qualidade de mercado.
+
+Para patches pequenos no contrato backend/Quant Brain, priorize:
+
+```powershell
+cd quant-brain
+python -m py_compile api\kb_trades.py api\server.py tests\test_contract.py
+python -m pytest -q tests/test_contract.py::TestKbTradeContract
+```
+
+Para patches de reconciliation/shadow, priorize:
+
+```powershell
+cd quant-brain
+python -m pytest -q tests/test_sniper_reconciliation.py tests/test_shadow_lifecycle.py -p no:cacheprovider
+```
+
 ## Dados Que Não Devem Ir Para Git
 
 ```text

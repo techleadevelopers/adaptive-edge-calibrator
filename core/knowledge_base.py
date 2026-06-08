@@ -7,7 +7,6 @@ métricas agregadas, janelas temporais, view materializadas, cache de queries.
 from __future__ import annotations
 
 import json
-import hashlib
 import os
 import time
 import asyncio
@@ -24,7 +23,6 @@ DB_PATH.parent.mkdir(exist_ok=True)
 _query_cache: OrderedDict = OrderedDict()
 _CACHE_MAX_SIZE = 100
 _CACHE_TTL_SECONDS = 30
-OUTCOME_STALE_SECONDS = int(os.environ.get("SIGNAL_OUTCOME_STALE_SECONDS", "900"))
 
 
 @dataclass
@@ -100,6 +98,9 @@ CREATE TABLE IF NOT EXISTS trade_outcomes (
     ema_cross TEXT,
     slippage_bps REAL DEFAULT 0,
     fee_paid_usdt REAL DEFAULT 0,
+    risk_tier TEXT,
+    size_multiplier REAL,
+    size_reason TEXT,
     timestamp REAL NOT NULL
 );
 
@@ -174,9 +175,6 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     first_event_seconds REAL,
     max_favorable_pct REAL,
     max_adverse_pct REAL,
-    predicted_probability REAL,
-    prediction_timestamp REAL,
-    model_version TEXT,
     finalized INTEGER DEFAULT 0,
     created_at REAL NOT NULL,
     finalized_at REAL
@@ -377,7 +375,6 @@ async def init_db():
     """Inicializa banco com todas as tabelas e migrações."""
     async with connect(DB_PATH) as db:
         await db.executescript(CREATE_TABLES)
-        await db.commit()
 
         # Migrações para tabelas existentes
         columns = await table_columns("signal_outcomes", DB_PATH)
@@ -405,6 +402,38 @@ async def init_db():
             "pnl_usdt": "REAL",
             "slippage_bps": "REAL DEFAULT 0",
             "fee_paid_usdt": "REAL DEFAULT 0",
+            "experiment_id": "TEXT",
+            "experiment_arm": "TEXT",
+            "policy_version": "TEXT",
+            "campaign_id": "TEXT",
+            "exit_reason": "TEXT",
+            "latency_drag_usdt": "REAL DEFAULT 0",
+            # Exit intelligence fields — added via migration for existing DBs
+            "mfe_pct": "REAL",
+            "mae_pct": "REAL",
+            "gave_back_pct": "REAL",
+            "exit_quality": "TEXT",
+            "exit_action_taken": "TEXT",
+            "entry_aggressive_score": "REAL",
+            "execution_priority": "REAL",
+            "coach_score": "REAL",
+            "playbook_score": "REAL",
+            "ml_probability": "REAL",
+            "execution_quality": "REAL",
+            "signal_id": "TEXT",
+            "regime": "TEXT",
+            "playbook": "TEXT",
+            "setup_type": "TEXT",
+            "regime_confidence": "REAL",
+            "playbook_version": "TEXT",
+            "stacking_depth": "INTEGER DEFAULT 1",
+            "risk_tier": "TEXT",
+            "size_multiplier": "REAL",
+            "size_reason": "TEXT",
+            "recommended_margin": "REAL",
+            "recommended_leverage": "REAL",
+            "max_loss_if_stop": "REAL",
+            "notional": "REAL",
         }
         for name, definition in trade_migrations.items():
             if name not in trade_columns:
@@ -428,13 +457,6 @@ async def init_db():
         signal_columns = await table_columns("signal_outcomes", DB_PATH)
         signal_migrations = {
             "market_event_id": "TEXT",
-            "feature_version": "TEXT NOT NULL DEFAULT 'legacy'",
-            "label_version": "TEXT NOT NULL DEFAULT 'price-window-v1'",
-            "label_source": "TEXT",
-            "outcome_source_id": "TEXT",
-            "predicted_probability": "REAL",
-            "prediction_timestamp": "REAL",
-            "model_version": "TEXT",
         }
         for name, definition in signal_migrations.items():
             if name not in signal_columns:
@@ -453,39 +475,120 @@ async def init_db():
             "ON trade_outcomes(source_id)"
         )
         await db.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_outcome_source "
-            "ON signal_outcomes(outcome_source_id)"
+            "CREATE INDEX IF NOT EXISTS idx_trade_experiment "
+            "ON trade_outcomes(experiment_id, experiment_arm, timestamp)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trades_playbook_ts "
+            "ON trade_outcomes(playbook, timestamp)"
+        )
+
+        # ── Signal lifecycle events (DEMO_LEARNING_AGGRESSIVE tracking) ──────
+        # Use executescript() so PostgresConnection._postgres_ddl() translates
+        # "INTEGER PRIMARY KEY AUTOINCREMENT" → "BIGSERIAL PRIMARY KEY" for PG.
+        await db.executescript(
+            """CREATE TABLE IF NOT EXISTS signal_lifecycle_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id TEXT,
+                event_type TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                score REAL,
+                risk_profile TEXT,
+                is_demo INTEGER DEFAULT 1,
+                metadata TEXT,
+                ts REAL NOT NULL
+            )"""
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lifecycle_signal "
+            "ON signal_lifecycle_events(signal_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lifecycle_type_ts "
+            "ON signal_lifecycle_events(event_type, ts)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_lifecycle_symbol_ts "
+            "ON signal_lifecycle_events(symbol, ts)"
+        )
+
+        # ── Exit Intelligence tables ──────────────────────────────────────────
+        # exit_outcomes: post-trade analysis record (1 per closed demo trade)
+        # exit_evaluations: every QB exit recommendation (many per trade lifecycle)
+        await db.executescript(
+            """CREATE TABLE IF NOT EXISTS exit_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id TEXT UNIQUE,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                is_demo INTEGER DEFAULT 1,
+                entry_price REAL,
+                exit_price REAL,
+                pnl_pct REAL,
+                mfe_pct REAL,
+                mae_pct REAL,
+                gave_back_pct REAL,
+                age_seconds REAL,
+                tp_pct REAL,
+                sl_pct REAL,
+                exit_quality TEXT,
+                exit_reason TEXT,
+                exit_action_taken TEXT,
+                entry_aggressive_score REAL,
+                btc_regime TEXT,
+                hour_utc INTEGER,
+                campaign_id TEXT,
+                experiment_id TEXT,
+                experiment_arm TEXT,
+                policy_version TEXT,
+                ts REAL NOT NULL
+            )"""
+        )
+        exit_columns = await table_columns("exit_outcomes", DB_PATH)
+        exit_migrations = {
+            "experiment_id": "TEXT",
+            "experiment_arm": "TEXT",
+            "policy_version": "TEXT",
+        }
+        for name, definition in exit_migrations.items():
+            if name not in exit_columns:
+                await db.execute(f"ALTER TABLE exit_outcomes ADD COLUMN {name} {definition}")
+        await db.executescript(
+            """CREATE TABLE IF NOT EXISTS exit_evaluations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id TEXT,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                action TEXT NOT NULL,
+                confidence REAL,
+                reason TEXT,
+                suggested_stop_pct REAL,
+                suggested_tp_pct REAL,
+                should_close INTEGER DEFAULT 0,
+                should_stack INTEGER DEFAULT 1,
+                protection_level TEXT,
+                unrealized_pnl_pct REAL,
+                mfe_pct REAL,
+                age_seconds REAL,
+                momentum_score REAL,
+                ts REAL NOT NULL
+            )"""
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exit_outcomes_symbol_ts "
+            "ON exit_outcomes(symbol, ts)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exit_outcomes_quality "
+            "ON exit_outcomes(exit_quality)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exit_evaluations_source "
+            "ON exit_evaluations(source_id)"
         )
 
         await db.commit()
-
-
-async def _reconcile_signal_outcome_on_db(
-    db: Any,
-    signal_id: str,
-    outcome_source_id: str,
-    hit: bool,
-    label_version: str,
-) -> bool:
-    cursor = await db.execute(
-        """UPDATE signal_outcomes
-           SET hit_configured=?, stopped=?, first_event=?,
-               finalized=1, finalized_at=?, label_source='realized_campaign',
-               label_version=?, outcome_source_id=?
-           WHERE signal_id=?
-             AND (outcome_source_id IS NULL OR outcome_source_id=?)""",
-        (
-            1 if hit else 0,
-            0 if hit else 1,
-            "CAMPAIGN_HIT" if hit else "CAMPAIGN_MISS",
-            time.time(),
-            label_version,
-            outcome_source_id,
-            signal_id,
-            outcome_source_id,
-        ),
-    )
-    return int(getattr(cursor, "rowcount", 0) or 0) > 0
 
 
 async def record_trade_outcome(
@@ -498,8 +601,34 @@ async def record_trade_outcome(
     rsi: float = 50.0, ema_cross: str = "FLAT",
     pnl_usdt: float = 0.0, slippage_bps: float = 0.0,
     fee_paid_usdt: float = 0.0,
-    signal_id: str | None = None,
-    label_version: str = "campaign-pnl-v1",
+    experiment_id: str = "",
+    experiment_arm: str = "",
+    policy_version: str = "",
+    campaign_id: str = "",
+    mfe_pct: float = 0.0,
+    mae_pct: float = 0.0,
+    exit_reason: str = "",
+    latency_drag_usdt: float = 0.0,
+    regime: str | None = None,
+    playbook: str | None = None,
+    setup_type: str | None = None,
+    regime_confidence: float | None = None,
+    playbook_version: str | None = None,
+    stacking_depth: int = 1,
+    execution_priority: float | None = None,
+    coach_score: float | None = None,
+    playbook_score: float | None = None,
+    ml_probability: float | None = None,
+    execution_quality: float | None = None,
+    signal_id: str = "",
+    entry_aggressive_score: float | None = None,
+    risk_tier: str | None = None,
+    size_multiplier: float | None = None,
+    size_reason: str | None = None,
+    recommended_margin: float | None = None,
+    recommended_leverage: float | None = None,
+    max_loss_if_stop: float | None = None,
+    notional: float | None = None,
 ) -> bool:
     """Registra outcome de trade com métricas avançadas."""
     win = 1 if pnl_pct > 0 else 0
@@ -515,166 +644,65 @@ async def record_trade_outcome(
                        SET source=?, is_demo=?, symbol=?, side=?, entry_price=?, exit_price=?,
                            pnl_pct=?, pnl_usdt=?, win=?, oi_at_entry=?, funding_at_entry=?,
                            volume_ratio=?, btc_regime=?, rsi_at_entry=?, ema_cross=?,
-                           slippage_bps=?, fee_paid_usdt=?, timestamp=?
+                           slippage_bps=?, fee_paid_usdt=?, experiment_id=?, experiment_arm=?,
+                           policy_version=?, campaign_id=?, mfe_pct=?, mae_pct=?,
+                           exit_reason=?, latency_drag_usdt=?, regime=?, playbook=?,
+                           setup_type=?, regime_confidence=?, playbook_version=?,
+                           stacking_depth=?, execution_priority=?, coach_score=?,
+                           playbook_score=?, ml_probability=?, execution_quality=?,
+                           signal_id=?, entry_aggressive_score=?, risk_tier=?,
+                           size_multiplier=?, size_reason=?, recommended_margin=?,
+                           recommended_leverage=?, max_loss_if_stop=?, notional=?,
+                           timestamp=?
                        WHERE source_id=?""",
                     (source, 1 if is_demo else 0, symbol, side, entry_price, exit_price,
                      pnl_pct, pnl_usdt, win, oi_change, funding,
                      volume_ratio, btc_regime, rsi, ema_cross,
-                     slippage_bps, fee_paid_usdt, time.time(), source_id)
+                     slippage_bps, fee_paid_usdt, experiment_id, experiment_arm,
+                     policy_version, campaign_id, mfe_pct, mae_pct, exit_reason,
+                     latency_drag_usdt, regime, playbook, setup_type, regime_confidence,
+                     playbook_version, stacking_depth, execution_priority, coach_score,
+                     playbook_score, ml_probability, execution_quality,
+                     signal_id, entry_aggressive_score, risk_tier, size_multiplier,
+                     size_reason, recommended_margin, recommended_leverage,
+                     max_loss_if_stop, notional, time.time(), source_id)
                 )
-                if signal_id:
-                    await _reconcile_signal_outcome_on_db(
-                        db, signal_id, source_id, pnl_usdt > 0, label_version
-                    )
                 await db.commit()
-                return False
+                return True
 
         cursor = await db.execute(
             """INSERT INTO trade_outcomes
                (source_id, source, is_demo, symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
                 oi_at_entry, funding_at_entry, volume_ratio, btc_regime,
-                rsi_at_entry, ema_cross, slippage_bps, fee_paid_usdt, timestamp)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                rsi_at_entry, ema_cross, slippage_bps, fee_paid_usdt,
+                experiment_id, experiment_arm, policy_version, campaign_id,
+                mfe_pct, mae_pct, exit_reason, latency_drag_usdt,
+                regime, playbook, setup_type, regime_confidence, playbook_version,
+                stacking_depth, execution_priority, coach_score, playbook_score,
+                ml_probability, execution_quality, signal_id, entry_aggressive_score,
+                risk_tier, size_multiplier, size_reason, recommended_margin,
+                recommended_leverage, max_loss_if_stop, notional,
+                timestamp)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(source_id) DO NOTHING""",
             (source_id, source, 1 if is_demo else 0, symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
              oi_change, funding, volume_ratio, btc_regime,
-             rsi, ema_cross, slippage_bps, fee_paid_usdt, time.time())
+             rsi, ema_cross, slippage_bps, fee_paid_usdt,
+             experiment_id, experiment_arm, policy_version, campaign_id,
+             mfe_pct, mae_pct, exit_reason, latency_drag_usdt,
+             regime, playbook, setup_type, regime_confidence, playbook_version,
+             stacking_depth, execution_priority, coach_score, playbook_score,
+             ml_probability, execution_quality, signal_id, entry_aggressive_score,
+             risk_tier, size_multiplier, size_reason, recommended_margin,
+             recommended_leverage, max_loss_if_stop, notional,
+             time.time())
         )
         if source_id and int(getattr(cursor, "rowcount", 0) or 0) == 0:
             return False
         await _update_hourly_metrics(db, symbol, side, pnl_pct, win)
         await _update_daily_metrics(db, symbol, side, pnl_pct, win)
-        if signal_id and source_id:
-            await _reconcile_signal_outcome_on_db(
-                db, signal_id, source_id, pnl_usdt > 0, label_version
-            )
         await db.commit()
         return True
-
-
-async def record_trade_outcomes_batch(outcomes: list[dict]) -> list[bool]:
-    """Write an idempotent outcome batch with one connection and one commit."""
-    results: list[bool] = []
-    reconciliations: list[tuple[str, str, bool, str]] = []
-    async with connect(DB_PATH) as db:
-        for outcome in outcomes:
-            source_id = outcome.get("source_id")
-            symbol = str(outcome["symbol"])
-            side = str(outcome["side"])
-            pnl_pct = float(outcome.get("pnl_pct", 0))
-            pnl_usdt = float(outcome.get("pnl_usdt", 0))
-            win = 1 if pnl_pct > 0 else 0
-
-            if source_id:
-                existing = await (await db.execute(
-                    "SELECT id FROM trade_outcomes WHERE source_id=?",
-                    (source_id,),
-                )).fetchone()
-                if existing:
-                    await db.execute(
-                        """UPDATE trade_outcomes
-                           SET source=?, is_demo=?, symbol=?, side=?, entry_price=?, exit_price=?,
-                               pnl_pct=?, pnl_usdt=?, win=?, oi_at_entry=?, funding_at_entry=?,
-                               volume_ratio=?, btc_regime=?, rsi_at_entry=?, ema_cross=?,
-                               slippage_bps=?, fee_paid_usdt=?, timestamp=?
-                           WHERE source_id=?""",
-                        (
-                            outcome.get("source", "manual"),
-                            1 if outcome.get("is_demo", False) else 0,
-                            symbol,
-                            side,
-                            float(outcome.get("entry_price", 0)),
-                            float(outcome.get("exit_price", 0)),
-                            pnl_pct,
-                            pnl_usdt,
-                            win,
-                            float(outcome.get("oi_change", 0)),
-                            float(outcome.get("funding", 0)),
-                            float(outcome.get("volume_ratio", 1)),
-                            outcome.get("btc_regime", "NEUTRAL"),
-                            float(outcome.get("rsi", 50)),
-                            outcome.get("ema_cross", "FLAT"),
-                            float(outcome.get("slippage_bps", 0)),
-                            float(outcome.get("fee_paid_usdt", 0)),
-                            time.time(),
-                            source_id,
-                        ),
-                    )
-                    results.append(True)
-                    signal_id = outcome.get("signal_id")
-                    if signal_id:
-                        reconciliations.append((
-                            str(signal_id),
-                            str(source_id),
-                            pnl_usdt > 0,
-                            str(outcome.get("label_version", "campaign-pnl-v1")),
-                        ))
-                    continue
-
-            cursor = await db.execute(
-                """INSERT INTO trade_outcomes
-                   (source_id, source, is_demo, symbol, side, entry_price, exit_price, pnl_pct, pnl_usdt, win,
-                    oi_at_entry, funding_at_entry, volume_ratio, btc_regime,
-                    rsi_at_entry, ema_cross, slippage_bps, fee_paid_usdt, timestamp)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(source_id) DO NOTHING""",
-                (
-                    source_id,
-                    outcome.get("source", "manual"),
-                    1 if outcome.get("is_demo", False) else 0,
-                    symbol,
-                    side,
-                    float(outcome.get("entry_price", 0)),
-                    float(outcome.get("exit_price", 0)),
-                    pnl_pct,
-                    pnl_usdt,
-                    win,
-                    float(outcome.get("oi_change", 0)),
-                    float(outcome.get("funding", 0)),
-                    float(outcome.get("volume_ratio", 1)),
-                    outcome.get("btc_regime", "NEUTRAL"),
-                    float(outcome.get("rsi", 50)),
-                    outcome.get("ema_cross", "FLAT"),
-                    float(outcome.get("slippage_bps", 0)),
-                    float(outcome.get("fee_paid_usdt", 0)),
-                    time.time(),
-                ),
-            )
-            inserted = not source_id or int(getattr(cursor, "rowcount", 0) or 0) > 0
-            results.append(inserted)
-            if inserted:
-                await _update_hourly_metrics(db, symbol, side, pnl_pct, win)
-                await _update_daily_metrics(db, symbol, side, pnl_pct, win)
-                signal_id = outcome.get("signal_id")
-                if signal_id and source_id:
-                    reconciliations.append((
-                        str(signal_id),
-                        str(source_id),
-                        pnl_usdt > 0,
-                        str(outcome.get("label_version", "campaign-pnl-v1")),
-                    ))
-        await db.commit()
-
-    for signal_id, source_id, hit, label_version in reconciliations:
-        await reconcile_signal_outcome(signal_id, source_id, hit, label_version)
-    return results
-
-
-async def reconcile_signal_outcome(
-    signal_id: str,
-    outcome_source_id: str,
-    hit: bool,
-    label_version: str = "campaign-pnl-v1",
-) -> bool:
-    """Attach one realized campaign label to one entry-time observation."""
-    if not signal_id or not outcome_source_id:
-        return False
-    async with connect(DB_PATH) as db:
-        reconciled = await _reconcile_signal_outcome_on_db(
-            db, signal_id, outcome_source_id, hit, label_version
-        )
-        await db.commit()
-        return reconciled
 
 
 async def _update_hourly_metrics(db: Any, symbol: str, side: str, pnl_pct: float, win: int):
@@ -734,7 +762,7 @@ async def save_feature_snapshot(symbol: str, features: dict):
                 spread_bps, btc_regime, bid_depth_5, ask_depth_5, book_imbalance, cvd)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                symbol, float(features.get("timestamp") or time.time()),
+                symbol, time.time(),
                 features.get("price", 0),
                 features.get("bid") or features.get("price", 0),
                 features.get("ask") or features.get("price", 0),
@@ -771,7 +799,6 @@ async def record_signal_decision(
     entry_price: float,
     estimated_cost_pct: float,
     target_moves: dict[str, float],
-    feature_version: str = "legacy",
 ) -> bool:
     if entry_price <= 0:
         return False
@@ -784,8 +811,8 @@ async def record_signal_decision(
                     entry_price, estimated_cost_pct,
                     target_configured_move_pct, target_050_move_pct,
                     target_100_move_pct, target_200_move_pct,
-                    feature_version, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     signal_id,
                     symbol,
@@ -804,7 +831,6 @@ async def record_signal_decision(
                     float(target_moves.get("0.5", 0)),
                     float(target_moves.get("1.0", 0)),
                     float(target_moves.get("2.0", 0)),
-                    feature_version,
                     time.time(),
                 ),
             )
@@ -851,9 +877,8 @@ async def finalize_signal_outcome(
                    hit_configured=?, hit_050=?, hit_100=?, hit_200=?, stopped=?,
                    first_event=?, first_event_seconds=?,
                    max_favorable_pct=?, max_adverse_pct=?,
-                   finalized=1, finalized_at=?, label_source='price_window',
-                   label_version='price-window-v1'
-               WHERE signal_id=? AND outcome_source_id IS NULL""",
+                   finalized=1, finalized_at=?
+               WHERE signal_id=?""",
             (
                 prices.get("30"),
                 prices.get("60"),
@@ -869,29 +894,6 @@ async def finalize_signal_outcome(
                 max_favorable_pct,
                 max_adverse_pct,
                 time.time(),
-                signal_id,
-            ),
-        )
-        await db.commit()
-
-
-async def record_signal_prediction(
-    signal_id: str,
-    probability: float | None,
-    prediction_timestamp: float,
-    model_version: str | None,
-) -> None:
-    if probability is None:
-        return
-    async with connect(DB_PATH) as db:
-        await db.execute(
-            """UPDATE signal_outcomes
-               SET predicted_probability=?, prediction_timestamp=?, model_version=?
-               WHERE signal_id=?""",
-            (
-                max(0.0, min(1.0, float(probability))),
-                float(prediction_timestamp),
-                model_version,
                 signal_id,
             ),
         )
@@ -969,15 +971,11 @@ async def get_signal_training_rows(
             f"""SELECT signal_id, symbol, side, decision, decision_group,
                       context_key, features,
                       target_configured_move_pct, estimated_cost_pct, hit_configured,
-                      stopped, first_event, created_at, finalized_at,
-                      strategy_version, config_hash, feature_version,
-                      label_version, label_source, outcome_source_id
+                      stopped, first_event, created_at
                FROM signal_outcomes
                WHERE finalized=1
                  {source_filter}
                  AND hit_configured IS NOT NULL
-                 AND finalized_at IS NOT NULL
-                 AND finalized_at >= created_at
                  {decision_filter}
                ORDER BY created_at ASC
                LIMIT ?""",
@@ -989,23 +987,6 @@ async def get_signal_training_rows(
         item["features"] = json.loads(item["features"])
         result.append(item)
     return result
-
-
-def signal_dataset_fingerprint(rows: list[dict]) -> str:
-    canonical = [
-        {
-            "signal_id": row.get("signal_id"),
-            "created_at": row.get("created_at"),
-            "finalized_at": row.get("finalized_at"),
-            "feature_version": row.get("feature_version"),
-            "label_version": row.get("label_version"),
-            "label": row.get("hit_configured"),
-            "features": row.get("features"),
-        }
-        for row in rows
-    ]
-    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 async def get_signal_training_summary(
@@ -1071,60 +1052,6 @@ async def get_signal_pipeline_summary() -> dict:
     }
 
 
-async def get_signal_readiness_diagnostics(
-    min_samples: int = 300,
-    source_type: str | None = None,
-) -> dict:
-    rows = await get_signal_training_rows(source_type=source_type)
-    now = time.time()
-    stale_after = max(OUTCOME_STALE_SECONDS, 600)
-    async with connect(DB_PATH) as db:
-        unresolved = await (await db.execute(
-            """SELECT COUNT(*), MIN(created_at)
-               FROM signal_outcomes
-               WHERE finalized=0 AND created_at <= ?""",
-            (now - stale_after,),
-        )).fetchone()
-        invalid = await (await db.execute(
-            """SELECT COUNT(*) FROM signal_outcomes
-               WHERE finalized=1 AND (
-                   hit_configured IS NULL OR finalized_at IS NULL OR finalized_at < created_at
-               )"""
-        )).fetchone()
-
-    hits = sum(1 for row in rows if int(row.get("hit_configured") or 0) == 1)
-    misses = len(rows) - hits
-    minority = min(hits, misses)
-    ratio = minority / len(rows) if rows else 0.0
-    if len(rows) < min_samples:
-        state = "COLLECTING"
-    elif hits == 0 or misses == 0:
-        state = "LABEL_BLOCKED"
-    elif ratio < 0.10:
-        state = "CLASS_IMBALANCED"
-    else:
-        state = "READY_TO_TRAIN"
-
-    versions: dict[str, int] = {}
-    for row in rows:
-        key = f"{row.get('feature_version', 'legacy')}|{row.get('label_version', 'legacy')}"
-        versions[key] = versions.get(key, 0) + 1
-
-    return {
-        "state": state,
-        "minSamples": min_samples,
-        "samples": len(rows),
-        "hits": hits,
-        "misses": misses,
-        "minorityClassRatio": round(ratio, 4),
-        "stalePending": int((unresolved or (0,))[0] or 0),
-        "oldestStalePendingAt": float((unresolved or (0, 0))[1] or 0),
-        "invalidOrLeakyLabels": int((invalid or (0,))[0] or 0),
-        "datasetFingerprint": signal_dataset_fingerprint(rows),
-        "versions": versions,
-    }
-
-
 async def get_recent_signal_outcomes(limit: int = 20, source_type: str | None = None) -> list[dict]:
     params: list[Any] = []
     source_filter = ""
@@ -1143,69 +1070,6 @@ async def get_recent_signal_outcomes(limit: int = 20, source_type: str | None = 
                ORDER BY created_at DESC
                LIMIT ?""",
             params,
-        )).fetchall()
-    return [dict(row) for row in rows]
-
-
-async def get_drift_signal_rows(limit: int = 5000) -> list[dict]:
-    async with connect(DB_PATH) as db:
-        db.row_factory = Row
-        rows = await (await db.execute(
-            """SELECT signal_id, symbol, side, source_type, strategy_version,
-                      features, target_configured_move_pct, estimated_cost_pct,
-                      hit_configured, stopped, first_event, max_adverse_pct,
-                      created_at, finalized_at,
-                      predicted_probability, prediction_timestamp, model_version
-               FROM signal_outcomes
-               WHERE predicted_probability IS NOT NULL
-               ORDER BY created_at ASC
-               LIMIT ?""",
-            (limit,),
-        )).fetchall()
-    result = []
-    for row in rows:
-        item = dict(row)
-        item["features"] = json.loads(item["features"])
-        result.append(item)
-    return result
-
-
-async def get_calibration_audit_rows(limit: int = 50000) -> list[dict]:
-    async with connect(DB_PATH) as db:
-        db.row_factory = Row
-        rows = await (await db.execute(
-            """SELECT signal_id, symbol, side, source_type, strategy_version,
-                      features, target_configured_move_pct, estimated_cost_pct,
-                      hit_configured, stopped, first_event, max_adverse_pct,
-                      created_at, finalized_at,
-                      predicted_probability, prediction_timestamp, model_version
-               FROM signal_outcomes
-               WHERE finalized=1
-                 AND hit_configured IS NOT NULL
-                 AND finalized_at IS NOT NULL
-                 AND finalized_at >= created_at
-               ORDER BY created_at ASC
-               LIMIT ?""",
-            (limit,),
-        )).fetchall()
-    result = []
-    for row in rows:
-        item = dict(row)
-        item["features"] = json.loads(item["features"])
-        result.append(item)
-    return result
-
-
-async def get_drift_trade_rows(limit: int = 5000) -> list[dict]:
-    async with connect(DB_PATH) as db:
-        db.row_factory = Row
-        rows = await (await db.execute(
-            """SELECT source_id, symbol, side, pnl_pct, pnl_usdt, win,
-                      btc_regime, timestamp
-               FROM trade_outcomes
-               ORDER BY timestamp ASC
-               LIMIT ?""",
-            (limit,),
         )).fetchall()
     return [dict(row) for row in rows]
 
@@ -1367,7 +1231,11 @@ async def get_recent_trade_outcomes(source: str = "all", limit: int = 500) -> li
                       COALESCE(is_demo, 0) AS is_demo,
                       symbol, side, entry_price, exit_price, pnl_pct,
                       pnl_usdt, win, btc_regime, slippage_bps,
-                      fee_paid_usdt, timestamp
+                      fee_paid_usdt, timestamp, experiment_id, experiment_arm,
+                      policy_version, campaign_id, mfe_pct, mae_pct, exit_reason,
+                      latency_drag_usdt, risk_tier, size_multiplier, size_reason,
+                      recommended_margin, recommended_leverage, max_loss_if_stop,
+                      notional
                FROM trade_outcomes
                {where}
                ORDER BY timestamp DESC
@@ -1417,8 +1285,225 @@ async def get_recent_trade_outcomes(source: str = "all", limit: int = 500) -> li
             "slippagePctNotional": abs(float(row[12] or 0)) / 10000,
             "exitReason": "TP" if pnl_usdt > 0 else "SL" if pnl_usdt < 0 else "MANUAL",
             "expectedTpProfit": abs(pnl_usdt),
+            "experimentId": str(row[15] or ""),
+            "experimentArm": str(row[16] or ""),
+            "policyVersion": str(row[17] or ""),
+            "campaignId": str(row[18] or ""),
+            "mfePct": float(row[19] or 0),
+            "maePct": float(row[20] or 0),
+            "experimentExitReason": str(row[21] or ""),
+            "latencyDragUsdt": float(row[22] or 0),
+            "riskTier": row[23],
+            "sizeMultiplier": float(row[24]) if row[24] is not None else None,
+            "sizeReason": row[25],
+            "recommendedMargin": float(row[26]) if row[26] is not None else None,
+            "recommendedLeverage": float(row[27]) if row[27] is not None else None,
+            "maxLossIfStop": float(row[28]) if row[28] is not None else None,
+            "notional": float(row[29]) if row[29] is not None else None,
         })
     return outcomes
+
+
+async def get_score_calibration_rows(days: int = 30, limit: int = 5000) -> list[dict]:
+    since = time.time() - max(1, int(days or 30)) * 86400
+    limit = max(1, min(int(limit or 5000), 20000))
+    async with connect(DB_PATH) as db:
+        rows = await (await db.execute(
+            """SELECT source_id, signal_id, symbol, side, pnl_usdt, pnl_pct, win,
+                      btc_regime, COALESCE(regime, btc_regime) AS regime,
+                      slippage_bps, latency_drag_usdt, timestamp,
+                      experiment_id, experiment_arm, policy_version, campaign_id,
+                      mfe_pct, mae_pct, exit_reason, exit_quality,
+                      entry_aggressive_score, execution_priority, coach_score,
+                      playbook_score, playbook, ml_probability, execution_quality
+               FROM trade_outcomes
+               WHERE timestamp >= ?
+               ORDER BY timestamp ASC
+               LIMIT ?""",
+            (since, limit),
+        )).fetchall()
+
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        aggressive = row[20]
+        execution_priority = row[21]
+        coach_score = row[22]
+        playbook_score = row[23]
+        ml_probability = row[25]
+        result.append({
+            "sourceId": row[0],
+            "signalId": row[1] or row[0],
+            "symbol": row[2],
+            "side": row[3],
+            "realizedPnl": float(row[4] or 0),
+            "pnlPct": float(row[5] or 0),
+            "win": bool(row[6]),
+            "btcRegime": row[7],
+            "regime": row[8] or row[7] or "NEUTRAL",
+            "slippageBps": float(row[9] or 0),
+            "latencyDragUsdt": float(row[10] or 0),
+            "timestamp": float(row[11] or 0),
+            "experimentId": row[12],
+            "experimentArm": row[13],
+            "policyVersion": row[14],
+            "campaignId": row[15],
+            "mfePct": float(row[16] or 0),
+            "maePct": float(row[17] or 0),
+            "exitReason": row[18],
+            "exitQuality": row[19],
+            "aggressiveScore": float(aggressive) if aggressive is not None else None,
+            "executionPriority": float(execution_priority) if execution_priority is not None else (
+                float(aggressive) if aggressive is not None else None
+            ),
+            "coachScore": float(coach_score) if coach_score is not None else (
+                float(execution_priority) if execution_priority is not None else None
+            ),
+            "playbookScore": float(playbook_score) if playbook_score is not None else None,
+            "playbook": row[24] or "UNKNOWN",
+            "mlProbability": float(ml_probability) if ml_probability is not None else None,
+            "executionQuality": float(row[26]) if row[26] is not None else None,
+        })
+    return result
+
+
+async def get_playbook_performance(days: int = 30) -> dict[str, dict]:
+    """Aggregated PnL/win-rate/PF by playbook for sizing and status endpoints."""
+    columns = await table_columns("trade_outcomes", DB_PATH)
+    if not {"playbook", "stacking_depth"}.issubset(columns):
+        return {}
+    since = time.time() - max(1, days) * 86400
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
+        rows = await (await db.execute(
+            """SELECT COALESCE(playbook, 'UNKNOWN') AS playbook,
+                      COUNT(*) AS trades,
+                      SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
+                      AVG(pnl_pct) AS avg_pnl_pct,
+                      SUM(CASE WHEN pnl_pct > 0 THEN pnl_pct ELSE 0 END) AS gross_profit,
+                      SUM(CASE WHEN pnl_pct < 0 THEN ABS(pnl_pct) ELSE 0 END) AS gross_loss,
+                      AVG(slippage_bps) AS avg_slippage_bps,
+                      AVG(stacking_depth) AS avg_stacking_depth
+               FROM trade_outcomes
+               WHERE timestamp >= ? AND playbook IS NOT NULL AND playbook != ''
+               GROUP BY 1
+               ORDER BY trades DESC""",
+            (since,),
+        )).fetchall()
+
+    performance: dict[str, dict] = {}
+    for row in rows:
+        d = dict(row)
+        trades = int(d.get("trades") or 0)
+        gross_loss = float(d.get("gross_loss") or 0.0)
+        gross_profit = float(d.get("gross_profit") or 0.0)
+        performance[str(d["playbook"])] = {
+            "trades": trades,
+            "wins": int(d.get("wins") or 0),
+            "winRate": round(float(d.get("wins") or 0) / trades, 4) if trades else None,
+            "avgPnlPct": round(float(d.get("avg_pnl_pct") or 0.0), 4),
+            "profitFactor": round(gross_profit / gross_loss, 4) if gross_loss > 0 else None,
+            "avgSlippageBps": round(float(d.get("avg_slippage_bps") or 0.0), 3),
+            "avgStackingDepth": round(float(d.get("avg_stacking_depth") or 0.0), 3),
+        }
+    return performance
+
+
+async def get_playbook_report(days: int = 30) -> dict:
+    columns = await table_columns("trade_outcomes", DB_PATH)
+    if not {"playbook", "regime", "stacking_depth", "entry_aggressive_score"}.issubset(columns):
+        return {
+            "days": days,
+            "byPlaybook": [],
+            "byRegime": [],
+            "bestTpSlByPlaybook": [],
+            "scoreBucketsByPlaybook": [],
+        }
+    since = time.time() - max(1, days) * 86400
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
+        by_playbook = await (await db.execute(
+            """SELECT COALESCE(playbook, 'UNKNOWN') AS playbook,
+                      COUNT(*) AS trades,
+                      SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
+                      AVG(pnl_pct) AS avg_pnl_pct,
+                      SUM(CASE WHEN pnl_pct > 0 THEN pnl_pct ELSE 0 END) AS gross_profit,
+                      SUM(CASE WHEN pnl_pct < 0 THEN ABS(pnl_pct) ELSE 0 END) AS gross_loss,
+                      AVG(slippage_bps) AS avg_slippage_bps,
+                      AVG(stacking_depth) AS avg_stacking_depth
+               FROM trade_outcomes
+               WHERE timestamp >= ? AND playbook IS NOT NULL AND playbook != ''
+               GROUP BY 1 ORDER BY trades DESC""",
+            (since,),
+        )).fetchall()
+        by_regime = await (await db.execute(
+            """SELECT COALESCE(regime, btc_regime, 'UNKNOWN') AS regime,
+                      COUNT(*) AS trades,
+                      AVG(pnl_pct) AS avg_pnl_pct,
+                      SUM(CASE WHEN pnl_pct > 0 THEN pnl_pct ELSE 0 END) AS gross_profit,
+                      SUM(CASE WHEN pnl_pct < 0 THEN ABS(pnl_pct) ELSE 0 END) AS gross_loss
+               FROM trade_outcomes
+               WHERE timestamp >= ?
+               GROUP BY 1 ORDER BY trades DESC""",
+            (since,),
+        )).fetchall()
+        tp_sl = await (await db.execute(
+            """SELECT COALESCE(playbook, 'UNKNOWN') AS playbook,
+                      COUNT(*) AS trades,
+                      AVG(mfe_pct) AS avg_mfe_pct,
+                      AVG(mae_pct) AS avg_mae_pct,
+                      AVG(stacking_depth) AS avg_stacking_depth
+               FROM trade_outcomes
+               WHERE timestamp >= ? AND playbook IS NOT NULL AND playbook != ''
+               GROUP BY 1 ORDER BY trades DESC""",
+            (since,),
+        )).fetchall()
+        score_buckets = await (await db.execute(
+            """SELECT COALESCE(playbook, 'UNKNOWN') AS playbook,
+                      CASE
+                        WHEN entry_aggressive_score IS NULL THEN 'unknown'
+                        WHEN entry_aggressive_score < 0.45 THEN 'low'
+                        WHEN entry_aggressive_score < 0.65 THEN 'mid'
+                        WHEN entry_aggressive_score < 0.80 THEN 'high'
+                        ELSE 'elite'
+                      END AS score_bucket,
+                      COUNT(*) AS trades,
+                      AVG(pnl_pct) AS avg_pnl_pct,
+                      SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS win_rate
+               FROM trade_outcomes
+               WHERE timestamp >= ? AND playbook IS NOT NULL AND playbook != ''
+               GROUP BY 1, 2 ORDER BY 1, 2""",
+            (since,),
+        )).fetchall()
+
+    def _fmt_profit_factor(row: Row) -> dict:
+        d = dict(row)
+        trades = int(d.get("trades") or 0)
+        gross_loss = float(d.get("gross_loss") or 0.0)
+        gross_profit = float(d.get("gross_profit") or 0.0)
+        wins = int(d.get("wins") or 0) if "wins" in d else None
+        out = {
+            k: (round(v, 4) if isinstance(v, float) else v)
+            for k, v in d.items()
+            if k not in {"gross_profit", "gross_loss"}
+        }
+        if wins is not None:
+            out["winRate"] = round(wins / trades, 4) if trades else None
+        out["profitFactor"] = round(gross_profit / gross_loss, 4) if gross_loss > 0 else None
+        return out
+
+    return {
+        "days": days,
+        "byPlaybook": [_fmt_profit_factor(row) for row in by_playbook],
+        "byRegime": [_fmt_profit_factor(row) for row in by_regime],
+        "bestTpSlByPlaybook": [
+            {k: (round(v, 4) if isinstance(v, float) else v) for k, v in dict(row).items()}
+            for row in tp_sl
+        ],
+        "scoreBucketsByPlaybook": [
+            {k: (round(v, 4) if isinstance(v, float) else v) for k, v in dict(row).items()}
+            for row in score_buckets
+        ],
+    }
 
 
 async def get_operational_risk_metrics(hours: int = 24) -> dict:
@@ -1896,3 +1981,342 @@ async def vacuum_db():
     async with connect(DB_PATH) as db:
         await db.execute("VACUUM")
         await db.execute("ANALYZE")
+
+
+# ========== SIGNAL LIFECYCLE EVENTS ==========
+
+async def record_lifecycle_event(
+    event_type: str,
+    symbol: str,
+    side: str,
+    signal_id: str | None = None,
+    score: float | None = None,
+    risk_profile: str | None = None,
+    is_demo: bool = True,
+    metadata: dict | None = None,
+) -> None:
+    """Record a signal lifecycle event for learning quality tracking."""
+    async with connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO signal_lifecycle_events
+               (signal_id, event_type, symbol, side, score, risk_profile, is_demo, metadata, ts)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                signal_id,
+                event_type,
+                symbol.upper(),
+                side.upper(),
+                score,
+                risk_profile,
+                1 if is_demo else 0,
+                json.dumps(metadata or {}),
+                time.time(),
+            ),
+        )
+        await db.commit()
+
+
+async def get_learning_metrics(hours: int = 24) -> dict:
+    """
+    Learning velocity and score-bucket metrics for monitoring QB evolution.
+    Shows whether high-score trades outperform low-score trades, which is
+    the primary signal that the Coach Ranker is improving.
+    """
+    since = time.time() - hours * 3600
+
+    async with connect(DB_PATH) as db:
+        db.row_factory = Row
+
+        # 1. Event counts by type (last N hours)
+        event_rows = await (await db.execute(
+            """SELECT event_type, COUNT(*) as cnt
+               FROM signal_lifecycle_events
+               WHERE ts >= ? AND is_demo=1
+               GROUP BY event_type ORDER BY cnt DESC""",
+            (since,),
+        )).fetchall()
+        event_counts = {r["event_type"]: r["cnt"] for r in event_rows}
+
+        # 2. Funnel: generated → executed → placed → tp/sl
+        generated  = event_counts.get("signal_generated", 0)
+        executed   = event_counts.get("signal_executed", 0)
+        placed     = event_counts.get("order_placed", 0)
+        tp_hits    = event_counts.get("tp_hit", 0)
+        sl_hits    = event_counts.get("sl_hit", 0)
+        timeouts   = event_counts.get("timeout", 0)
+        api_errors = event_counts.get("api_error", 0)
+        dupes      = event_counts.get("duplicate_rejected", 0)
+
+        closed = tp_hits + sl_hits + timeouts
+        win_rate = round(tp_hits / closed * 100, 1) if closed > 0 else None
+
+        # 3. Score-bucket performance from signal_outcomes (finalized)
+        # GROUP BY 1 (positional) is used instead of alias for Postgres compat.
+        bucket_rows = await (await db.execute(
+            """SELECT
+                CASE
+                    WHEN max_favorable_pct IS NULL THEN 'no_data'
+                    WHEN target_configured_move_pct <= 0 THEN 'no_target'
+                    ELSE 'has_outcome'
+                END as bucket_type,
+                COUNT(*) as cnt,
+                AVG(CASE WHEN hit_configured=1 THEN 1.0 ELSE 0.0 END) as win_rate,
+                AVG(max_favorable_pct) as avg_mfe,
+                AVG(max_adverse_pct) as avg_mae,
+                AVG(target_configured_move_pct) as avg_target
+               FROM signal_outcomes
+               WHERE created_at >= ? AND finalized=1
+               GROUP BY 1""",
+            (since,),
+        )).fetchall()
+        outcome_summary = [dict(r) for r in bucket_rows]
+
+        # 4. Best performing symbols (by win rate, min 5 finalized)
+        # HAVING COUNT(*) used instead of alias for Postgres compat.
+        sym_rows = await (await db.execute(
+            """SELECT symbol, side,
+                COUNT(*) as trades,
+                AVG(CASE WHEN hit_configured=1 THEN 1.0 ELSE 0.0 END) as win_rate,
+                AVG(max_favorable_pct) as avg_mfe
+               FROM signal_outcomes
+               WHERE created_at >= ? AND finalized=1
+               GROUP BY symbol, side
+               HAVING COUNT(*) >= 5
+               ORDER BY win_rate DESC
+               LIMIT 10""",
+            (since,),
+        )).fetchall()
+        top_symbols = [dict(r) for r in sym_rows]
+
+        # 5. Samples by risk_profile
+        profile_rows = await (await db.execute(
+            """SELECT risk_profile, COUNT(*) as cnt
+               FROM signal_lifecycle_events
+               WHERE ts >= ? AND event_type='order_placed'
+               GROUP BY risk_profile ORDER BY cnt DESC""",
+            (since,),
+        )).fetchall()
+        profile_counts = {(r["risk_profile"] or "unknown"): r["cnt"] for r in profile_rows}
+
+        # 6. Total finalized signals and pending
+        totals = await (await db.execute(
+            """SELECT
+                SUM(CASE WHEN finalized=1 THEN 1 ELSE 0 END) as finalized,
+                SUM(CASE WHEN finalized=0 THEN 1 ELSE 0 END) as pending
+               FROM signal_outcomes WHERE created_at >= ?""",
+            (since,),
+        )).fetchone()
+
+    return {
+        "windowHours": hours,
+        "funnel": {
+            "generated": generated,
+            "executed": executed,
+            "placed": placed,
+            "tpHits": tp_hits,
+            "slHits": sl_hits,
+            "timeouts": timeouts,
+            "apiErrors": api_errors,
+            "duplicateRejected": dupes,
+            "closed": closed,
+            "winRate": win_rate,
+        },
+        "eventCounts": event_counts,
+        "outcomeSummary": outcome_summary,
+        "topSymbols": top_symbols,
+        "profileCounts": profile_counts,
+        "signalTotals": {
+            "finalized": int(totals["finalized"] or 0) if totals else 0,
+            "pending": int(totals["pending"] or 0) if totals else 0,
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Exit Intelligence — persistence helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def record_exit_outcome_row(
+    *,
+    source_id: str,
+    symbol: str,
+    side: str,
+    is_demo: int = 1,
+    entry_price: float = 0.0,
+    exit_price: float = 0.0,
+    pnl_pct: float,
+    mfe_pct: float,
+    mae_pct: float,
+    gave_back_pct: float,
+    age_seconds: float,
+    tp_pct: float,
+    sl_pct: float,
+    exit_quality: str,
+    exit_reason: str,
+    exit_action_taken: str = "",
+    entry_aggressive_score: float = 0.0,
+    btc_regime: str = "NEUTRAL",
+    hour_utc: int = 0,
+    campaign_id: str = "",
+    experiment_id: str = "",
+    experiment_arm: str = "",
+    policy_version: str = "",
+) -> None:
+    """Insert (or upsert) one exit outcome record."""
+    ts = __import__("time").time()
+    async with connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO exit_outcomes
+               (source_id, symbol, side, is_demo, entry_price, exit_price,
+                pnl_pct, mfe_pct, mae_pct, gave_back_pct, age_seconds,
+                tp_pct, sl_pct, exit_quality, exit_reason, exit_action_taken,
+                entry_aggressive_score, btc_regime, hour_utc, campaign_id,
+                experiment_id, experiment_arm, policy_version, ts)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(source_id) DO UPDATE SET
+                 exit_quality=excluded.exit_quality,
+                 gave_back_pct=excluded.gave_back_pct,
+                 mfe_pct=excluded.mfe_pct,
+                 mae_pct=excluded.mae_pct,
+                 pnl_pct=excluded.pnl_pct,
+                 exit_action_taken=excluded.exit_action_taken,
+                 experiment_id=excluded.experiment_id,
+                 experiment_arm=excluded.experiment_arm,
+                 policy_version=excluded.policy_version""",
+            (source_id, symbol, side, is_demo, entry_price, exit_price,
+             pnl_pct, mfe_pct, mae_pct, gave_back_pct, age_seconds,
+             tp_pct, sl_pct, exit_quality, exit_reason, exit_action_taken,
+             entry_aggressive_score, btc_regime, hour_utc, campaign_id,
+             experiment_id, experiment_arm, policy_version, ts),
+        )
+        await db.commit()
+
+
+async def record_exit_evaluation_row(
+    *,
+    source_id: str,
+    symbol: str,
+    side: str,
+    action: str,
+    confidence: float,
+    reason: str,
+    suggested_stop_pct: float,
+    suggested_tp_pct: float,
+    should_close: int,
+    should_stack: int,
+    protection_level: str,
+    unrealized_pnl_pct: float,
+    mfe_pct: float,
+    age_seconds: float,
+    momentum_score: float,
+) -> None:
+    """Insert one exit evaluation record (each QB recommendation stored)."""
+    ts = __import__("time").time()
+    async with connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO exit_evaluations
+               (source_id, symbol, side, action, confidence, reason,
+                suggested_stop_pct, suggested_tp_pct, should_close, should_stack,
+                protection_level, unrealized_pnl_pct, mfe_pct, age_seconds,
+                momentum_score, ts)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (source_id, symbol, side, action, confidence, reason,
+             suggested_stop_pct, suggested_tp_pct, should_close, should_stack,
+             protection_level, unrealized_pnl_pct, mfe_pct, age_seconds,
+             momentum_score, ts),
+        )
+        await db.commit()
+
+
+async def query_exit_stats(
+    symbol: str | None = None,
+    side: str | None = None,
+    days: int = 30,
+) -> dict:
+    """
+    Exit quality analytics — win-rate / PnL / MFE averages by quality label.
+    Used by the /exit/stats endpoint and as a Coach Ranker learning signal.
+    """
+    since = __import__("time").time() - days * 86400
+    filters: list[str] = ["ts >= ?"]
+    params: list = [since]
+    if symbol:
+        filters.append("symbol = ?")
+        params.append(symbol.upper())
+    if side:
+        filters.append("side = ?")
+        params.append(side.upper())
+    where = " AND ".join(filters)
+
+    async with connect(DB_PATH) as db:
+        # Quality breakdown
+        quality_rows = await (await db.execute(
+            f"""SELECT exit_quality,
+                       COUNT(*) as cnt,
+                       AVG(pnl_pct) as avg_pnl,
+                       SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as win_rate,
+                       AVG(mfe_pct) as avg_mfe,
+                       AVG(mae_pct) as avg_mae,
+                       AVG(gave_back_pct) as avg_gave_back
+               FROM exit_outcomes
+               WHERE {where}
+               GROUP BY 1
+               ORDER BY cnt DESC""",
+            params,
+        )).fetchall()
+
+        # Action breakdown (what recommendations led to which outcomes)
+        action_rows = await (await db.execute(
+            f"""SELECT exit_action_taken,
+                       COUNT(*) as cnt,
+                       AVG(pnl_pct) as avg_pnl,
+                       SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as win_rate,
+                       AVG(gave_back_pct) as avg_gave_back
+               FROM exit_outcomes
+               WHERE {where} AND exit_action_taken != ''
+               GROUP BY 1
+               ORDER BY cnt DESC""",
+            params,
+        )).fetchall()
+
+        # Symbol breakdown
+        symbol_rows = await (await db.execute(
+            f"""SELECT symbol,
+                       COUNT(*) as cnt,
+                       AVG(pnl_pct) as avg_pnl,
+                       AVG(mfe_pct) as avg_mfe,
+                       AVG(gave_back_pct) as avg_gave_back
+               FROM exit_outcomes
+               WHERE {where}
+               GROUP BY 1
+               ORDER BY cnt DESC
+               LIMIT 20""",
+            params,
+        )).fetchall()
+
+        # Overall summary
+        summary = await (await db.execute(
+            f"""SELECT COUNT(*) as total,
+                       AVG(pnl_pct) as avg_pnl,
+                       AVG(mfe_pct) as avg_mfe,
+                       AVG(mae_pct) as avg_mae,
+                       AVG(gave_back_pct) as avg_gave_back,
+                       AVG(age_seconds) as avg_age_sec,
+                       SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as win_rate
+               FROM exit_outcomes
+               WHERE {where}""",
+            params,
+        )).fetchone()
+
+    def _fmt(row: dict) -> dict:
+        return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in dict(row).items()}
+
+    return {
+        "days": days,
+        "symbol": symbol,
+        "side": side,
+        "summary": _fmt(summary) if summary else {},
+        "byQuality": [_fmt(r) for r in quality_rows],
+        "byAction": [_fmt(r) for r in action_rows],
+        "bySymbol": [_fmt(r) for r in symbol_rows],
+    }

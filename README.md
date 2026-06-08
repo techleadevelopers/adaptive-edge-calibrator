@@ -1,474 +1,298 @@
-# Intelligence Capture Edge - AI
+# Quant Brain
 
-is a standalone Python intelligence engine designed for edge intelligence, mathematical strategy validation, and positive Realized PnL optimization.
+Serviço Python/FastAPI de inteligência quantitativa do BingX Futures Dashboard.
+Ele não envia ordens. Sua responsabilidade é coletar contexto de mercado,
+finalizar sinais, estudar resultados, avaliar edge, monitorar drift e produzir
+evidência auditável para o backend executor.
 
-It analyzes historical and real-time transaction telemetry to detect edge drift, simulate gate rejections, identify toxic market contexts, and feed the BingX execution pipeline with high-probability parameters.
+Este sistema é experimental. Modelo, score, AUC ou win rate não garantem lucro.
+Autoridade de execução permanece no backend Node.js.
 
-This is not an order execution service. It is the research, telemetry, and intelligence layer behind the execution stack.
-
-## Objective
-
-The objective is to transform raw market data and realized trade outcomes into actionable quantitative intelligence.
-
-Quant Brain exists to answer operational questions:
-
-- Which symbols are producing real edge after fees and losses?
-- Which hours are toxic and should be blocked?
-- Is BTC regime improving or destroying the current strategy?
-- Is the edge stable, improving, or drifting down?
-- Which setups should be rejected before capital is exposed?
-- Which parameters should be sent to the execution backend?
-- Is the bot producing positive Realized PnL or only high trade count?
-
-The target is not prediction for its own sake. The target is positive realized PnL through measured, repeatable micro-edge.
-
-## Core Design
+## Responsabilidades
 
 ```text
-Market data
-  -> feature extraction
-  -> tactical anomaly detection
-  -> knowledge base update
-  -> strategic edge report
-  -> AI analysis when configured
-  -> parameter recommendations
-  -> BingX execution pipeline
+Market data -> feature snapshots -> signal lifecycle -> labels
+            -> shadow model -> calibration/profitability
+            -> edge-v3 decision -> backend executor
+            -> realized outcomes -> knowledge base -> next cycle
 ```
 
-Quant Brain separates intelligence from execution:
+Quant Brain responde:
 
-- **Backend Node.js** signs orders, manages sessions, executes BingX calls, and stores realized trade telemetry.
-- **Quant Brain Python** studies market behavior, realized outcomes, edge evolution, toxic contexts, and strategic recommendations.
+- o dado de mercado está completo, fresco e consistente?
+- o contexto atual possui edge líquido após custos?
+- target ou stop configurado foi atingido primeiro?
+- o modelo melhora o baseline em validação temporal?
+- a probabilidade está calibrada?
+- há drift de feature, previsão, calibração ou expectativa?
+- profundidades adicionais de stacking agregam valor fora da amostra?
+- um challenger possui evidência suficiente para promoção?
 
-## What It Does
+## Estado Implementado
 
-### Real-Time Market Intelligence
+- FastAPI com liveness, readiness, métricas, request ID, rate limit e gzip;
+- PostgreSQL com schema isolado ou SQLite como fallback local;
+- Feature Engine para preço, volume, OI, funding, RSI, ATR, spread e regime BTC;
+- snapshots multi-timeframe e `marketEventId`;
+- tactical loop, macro candle regime, shadow sampler e manutenção de modelo;
+- finalização de sinais com janela configurável;
+- classes `ALLOW`, `WAIT` e `BLOCK`, além de origem do sinal;
+- modelo shadow com mínimo de 300 amostras;
+- split cronológico purgado e walk-forward;
+- comparação Brier contra baseline, AUC, qualidade de dados e simulação de
+  lucratividade;
+- contrato rígido `edge-v3` com proveniência;
+- drift monitor com thresholds configuráveis;
+- governança champion/challenger com artefatos content-addressed e audit log;
+- retenção configurável por classe de dado;
+- endpoints de knowledge base, inteligência, notícias e diagnóstico.
 
-The `FeatureEngine` monitors selected futures symbols and builds live snapshots with:
+## Separação De Responsabilidades
 
-- price;
-- price change;
-- open interest movement;
-- volume ratio;
-- funding rate;
-- approximate RSI;
-- EMA state;
-- BTC regime;
-- anomaly flags.
+### Backend Node.js
 
-These snapshots are exposed through the `/market/*` endpoints.
+- guarda API Key/Secret em sessão;
+- assina chamadas BingX;
+- controla capital, posições, idempotência e TP/SL;
+- decide se uma ordem pode ser enviada;
+- mantém monitoramento e reconciliação.
 
-### Tactical Layer
+### Quant Brain
 
-The tactical layer looks for short-term patterns and active alerts.
+- coleta e normaliza features;
+- registra e finaliza sinais;
+- calcula score, probabilidade e incerteza;
+- mede performance histórica e drift;
+- recomenda, mas não envia ordens.
 
-It is used to detect conditions such as:
+## Contrato `edge-v3`
 
-- unusual volume expansion;
-- open interest displacement;
-- BTC regime alignment;
-- fast market anomalies;
-- symbol-specific tactical opportunities.
+O backend chama:
+
+```text
+POST /edge/evaluate
+```
+
+O request inclui, entre outros:
+
+- `contractVersion=edge-v3`;
+- `signalId`;
+- `marketEventId`;
+- símbolo, side e positionSide;
+- `featureVersion`;
+- timestamp da feature e da requisição;
+- validade da decisão;
+- referência de preço;
+- configuração econômica e contexto.
+
+O Quant Brain:
+
+- rejeita versão incompatível;
+- exige IDs de proveniência;
+- controla claim de evento para evitar duplicidade;
+- devolve os mesmos IDs, símbolo e lados;
+- informa timestamp, idade do dado, score, probabilidade, incerteza e decisão;
+- pode devolver `driftPolicy`.
+
+O backend valida a resposta com Zod e rejeita:
+
+- contrato, feature ou proveniência divergente;
+- predição anterior à requisição;
+- predição ou dado de mercado stale;
+- score/probabilidade presentes quando `available=false`.
+
+O schema compartilhado vive em:
+
+```text
+contracts/quant-brain-edge-v3.json
+```
+
+## Market Data E Features
+
+O `FeatureEngine` consulta a BingX e produz snapshots com:
+
+- preço, bid/ask e spread;
+- volume e volume ratio;
+- open interest;
+- funding;
+- RSI, EMA, ATR e aceleração;
+- contexto BTC;
+- frames `1m`, `5m` e `15m`;
+- candle regime macro `1h` e `4h`;
+- qualidade e timestamp de origem;
+- `market_event_id`.
+
+O tactical loop persiste snapshots para permitir finalização posterior mesmo
+após cold start ou perda do cache em memória.
 
 Endpoints:
 
 ```text
-GET  /tactical/alerts
+GET /market/snapshots
+GET /market/snapshots/{symbol}
+GET /market/anomalies
+GET /market/macro-regime
+GET /sniper/btc-commander
+GET /sniper/evaluate/{symbol}
+GET /tactical/alerts
 POST /tactical/analyze
 ```
 
-### Strategic Layer
+## Ciclo De Sinal E Labels
 
-The strategic layer looks at accumulated results over larger windows.
+Um sinal registrado mantém:
 
-It evaluates:
+- decisão e `decision_group`;
+- origem: hipotético, shadow sampler, VST ou outra fonte configurada;
+- símbolo, lado e contexto;
+- feature/config/label versions;
+- preço executável;
+- target, stop e custo estimado;
+- IDs de sinal e evento;
+- timestamps e janela de observação.
 
-- edge evolution;
-- win rate migration;
-- average PnL drift;
-- symbol ranking;
-- side-specific performance;
-- structural changes in the strategy;
-- long-term tactical decay.
-
-Endpoints:
-
-```text
-GET  /strategic/report
-GET  /strategic/edge-evolution
-POST /strategic/analyze
-POST /strategic/hypotheses
-```
-
-### Knowledge Base
-
-The Knowledge Base stores operational observations and trade outcomes in SQLite.
-
-It is the memory layer for:
-
-- historical feature snapshots;
-- observed tactical patterns;
-- trade outcomes;
-- symbol statistics;
-- strategic insights;
-- generated hypotheses.
-
-Runtime database:
+A finalização verifica qual evento ocorreu primeiro dentro da janela:
 
 ```text
-data/knowledge.db
+target configurado -> hit
+stop configurado   -> miss
+janela expirada    -> resultado conforme trajetória disponível
 ```
 
-This file is private runtime data and must not be committed to Git.
+Para LONG, entrada/saída usam ask/bid executáveis; SHORT usa o inverso. Valores
+não finitos e preços inválidos são descartados.
 
-Endpoints:
+Configuração:
 
-```text
-GET  /kb/patterns
-GET  /kb/observations
-GET  /kb/insights
-GET  /kb/stats
-GET  /kb/stats/{symbol}
-POST /kb/trades
-GET  /kb/feature-history/{symbol}
+```env
+SIGNAL_OUTCOME_WINDOW_SECONDS=300
+SIGNAL_OUTCOME_MIN_AGE_SECONDS=300
+SIGNAL_DEDUPE_SECONDS=300
 ```
-
-## AI Analyst
-
-Quant Brain can run AI-assisted analysis when `ANTHROPIC_API_KEY` is configured.
-
-The AI layer is used for:
-
-- tactical explanation of active alerts;
-- weekly strategic review;
-- hypothesis generation;
-- detecting market regime changes;
-- summarizing why edge may be improving or degrading.
-
-Without `ANTHROPIC_API_KEY`, the system still runs the quantitative layers. AI endpoints return `ai_enabled: false` or operate without external model reasoning.
-
-## Realized PnL Optimization
-
-The engine is designed around Realized PnL, not theoretical signal quality.
-
-Important metrics:
-
-- realized PnL;
-- win rate;
-- average win;
-- average loss;
-- profit factor;
-- edge drift;
-- toxic hours;
-- toxic symbols;
-- BTC regime impact;
-- fee drag;
-- gate rejection quality.
-
-The intended optimization loop:
-
-```text
-trade outcome
-  -> knowledge base
-  -> symbol/hour/regime statistics
-  -> edge drift analysis
-  -> gate recommendation
-  -> backend execution parameters
-  -> fewer low-quality entries
-  -> higher realized PnL quality
-```
-
-## Gate Rejection Simulation
-
-Quant Brain should be used to understand which filters would have prevented losing trades.
-
-Examples:
-
-- reject symbol after negative rolling PnL;
-- reject trading hour with low win rate;
-- reject BTC counter-regime entries;
-- reject setups with poor historical profit factor;
-- reject when recent edge drift is negative;
-- reject when expected gain is smaller than fee/slippage cost.
-
-This matters because the system target is not maximum activity. The target is maximum quality of accepted entries.
-
-Available endpoint:
-
-```text
-GET /simulate/gate-rejections?days=30&min_avg_pnl=0
-```
-
-The response compares baseline PnL against hypothetical rejection gates by symbol, hour, and BTC regime.
-
-## Entry Recommendation
-
-The recommendation endpoint scores a pending entry using realized PnL history.
-
-```text
-POST /recommend/entry
-```
-
-Example payload:
-
-```json
-{
-  "symbol": "ETH-USDT",
-  "position_side": "LONG",
-  "btc_regime": "BULL",
-  "hour_utc": 14,
-  "shadow_only": true
-}
-```
-
-The endpoint returns:
-
-- `shadowRecommendation`: whether the intelligence layer would allow the entry;
-- `allow`: live gate result, disabled when `shadow_only=true`;
-- `score`: 0-1 realized-edge score;
-- `risk`: `shadow_only`, `scout`, `standard`, `aggressive`, or `reject`;
-- `suggestedMarginUsdt`: suggested capital bucket: `0`, `0.50`, `1.00`, or `2.00`;
-- `reasons`: audit trail for allow/reject;
-- `stats`: symbol, cluster, regime, hour, and recent PnL statistics.
-
-This should run in shadow mode until at least 100-300 closed trades prove that it improves net Realized PnL.
-
-## Integration With BingX Execution Pipeline
-
-Expected integration flow:
-
-```text
-BingX execution backend
-  -> closes or records trade
-  -> POST /kb/trades
-  -> Quant Brain updates knowledge base
-  -> strategic/tactical endpoints expose recommendations
-  -> dashboard or backend reads recommendations
-  -> execution gates are adjusted
-```
-
-The Node backend remains responsible for:
-
-- session security;
-- API key handling;
-- HMAC signing;
-- order submission;
-- position management;
-- immediate execution safety.
-
-Quant Brain remains responsible for:
-
-- analysis;
-- edge intelligence;
-- historical learning;
-- AI-assisted reasoning;
-- strategy validation.
-
-## Requirements
-
-Required:
-
-- Python 3.11+
-- pip or uv
-- internet access for market data
-
-Optional:
-
-- `ANTHROPIC_API_KEY` for AI analysis
-- persistent disk if deployed in cloud
-
-## Environment Variables
-
-| Variable | Required | Default | Purpose |
-|---|---:|---:|---|
-| `PORT` | No | `9000` | HTTP port used by Uvicorn/FastAPI. |
-| `ANTHROPIC_API_KEY` | No | empty | Enables AI analyst functionality. |
-| `QUANT_BRAIN_API_TOKEN` | No | empty | Protects write/evaluation endpoints; use the same value in the backend. |
-
-## Sniper Learning Safety
-
-The primary learning label follows the executor's configured
-`takeProfitPct` and `stopLossPct`. Fixed `0.50`, `1.00`, and `2.00` USDT
-targets remain auxiliary opportunity metrics.
-
-Signal outcomes:
-
-- use executable ask entry / bid exit for long positions and the inverse for shorts;
-- are limited to the first 300 seconds after the signal;
-- record whether configured target or stop happened first;
-- separate `ALLOW`, `WAIT`, and `BLOCK` samples;
-- separate hypothetical candidates from executed outcomes;
-- include fee, slippage, strategy version, and configuration identity.
-
-The statistical model is shadow-only. Training uses temporal validation and
-only persists a model when its calibrated Brier score beats the historical
-baseline on the held-out period.
 
 Endpoints:
 
 ```text
 POST /signals/finalize
 GET  /signals/edge/{symbol}
-POST /models/sniper/train
-GET  /models/sniper/status
-POST /news/events
-GET  /news/context/{symbol}
+GET  /signals/shadow-sampler/status
+POST /signals/shadow-sampler/run
 ```
 
-Example:
+## Shadow Sampler
+
+O sampler gera observações sem exigir execução real. Ele roda sob o Job
+Supervisor e registra candidatos dos símbolos/lados configurados.
 
 ```env
-PORT=9000
-ANTHROPIC_API_KEY=
+SHADOW_SAMPLER_ENABLED=true
+SHADOW_SAMPLER_INTERVAL_SECONDS=60
+SHADOW_SAMPLER_WINDOW_SECONDS=300
+SHADOW_SAMPLER_DEDUPE_SECONDS=300
+SHADOW_SAMPLER_BOOTSTRAP_SAMPLES=3
+SHADOW_SAMPLER_SYMBOLS=
 ```
 
-## Local Run
+Parâmetros econômicos usados para labels:
 
-PowerShell:
-
-```powershell
-cd quant-brain
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python main.py
+```env
+SHADOW_SAMPLER_LEVERAGE=14
+SHADOW_SAMPLER_MARGIN_PER_TRADE=5
+SHADOW_SAMPLER_TAKE_PROFIT_PCT=0.22
+SHADOW_SAMPLER_STOP_LOSS_PCT=0.55
+SHADOW_SAMPLER_TAKER_FEE_BPS=5
+SHADOW_SAMPLER_SLIPPAGE_BPS_PER_SIDE=2
+SHADOW_SAMPLER_ESTIMATED_FUNDING_COST_PCT=0
 ```
 
-Healthcheck:
+Esses valores definem o problema que o modelo aprende. Alterá-los muda label,
+break-even e interpretação da probabilidade.
+
+## Treinamento Do Modelo
+
+O modelo shadow exige no mínimo:
 
 ```text
-GET http://localhost:9000/health
+MIN_TRAINING_SAMPLES = 300
 ```
 
-Expected response shape:
+O pipeline atual:
 
-```json
-{
-  "status": "ok",
-  "ai_enabled": false,
-  "symbols_monitored": 10,
-  "snapshots_cached": 10
-}
-```
+1. carrega sinais finalizados;
+2. ordena cronologicamente;
+3. aplica split cronológico purgado;
+4. executa walk-forward temporal;
+5. treina features numéricas e categóricas;
+6. mede Brier, AUC e baseline;
+7. simula thresholds e EV após custos;
+8. calcula qualidade, cobertura, break-even e Kelly;
+9. persiste metadados e artefato somente quando há melhoria de baseline ou
+   lucratividade verificada.
 
-## Run With Uvicorn
-
-```powershell
-uvicorn api.server:app --host 0.0.0.0 --port 9000
-```
-
-## Repository Rules
-
-This directory is a standalone Git repository.
-
-Commit from inside `quant-brain/`:
-
-```powershell
-cd quant-brain
-git add .
-git commit -m "feat: update quant brain"
-git push
-```
-
-Do not commit:
+Status e treinamento:
 
 ```text
-.env
-.venv/
-__pycache__/
-data/knowledge.db
-*.log
+POST /models/sniper/train
+GET  /models/sniper/status
 ```
 
-## Deployment Notes
+O modelo continua shadow. Treinar não promove automaticamente autoridade de
+execução.
 
-For cloud deploy:
+## Lucratividade E Calibração
 
-- configure the service root as `quant-brain`;
-- install dependencies from `requirements.txt` or `pyproject.toml`;
-- start with `python main.py` or `uvicorn api.server:app --host 0.0.0.0 --port $PORT`;
-- configure `DATABASE_URL` with the same Railway Postgres used by the backend;
-- set `QUANT_BRAIN_DB_SCHEMA=quant_brain` so Quant tables remain isolated;
-- configure `ANTHROPIC_API_KEY` only in the cloud secret manager.
+O status do modelo expõe:
 
-When `DATABASE_URL` or `QUANT_BRAIN_DATABASE_URL` is present, the service creates
-and uses only the configured PostgreSQL schema. Without either variable it falls
-back to `data/knowledge.db` for local development and tests.
+- amostras disponíveis e mínimo;
+- classes hit/miss;
+- AUC;
+- Brier do modelo e baseline;
+- threshold ótimo;
+- EV simulado;
+- win rate no threshold;
+- cobertura;
+- break-even win rate;
+- Kelly fraction;
+- qualidade do dataset;
+- `profitabilityVerified`.
 
-Recommended Railway variables:
+Alta AUC sem calibração ou EV líquido positivo não é critério suficiente para
+uso operacional.
 
-```text
-DATABASE_URL=${{Postgres.DATABASE_URL}}
-QUANT_BRAIN_DB_SCHEMA=quant_brain
-QUANT_BRAIN_DB_POOL_SIZE=5
-QUANT_BRAIN_DB_COMMAND_TIMEOUT=30
-DB_INIT_TIMEOUT_SECONDS=20
-DB_INIT_RETRY_SECONDS=10
-MODEL_MAINTENANCE_SECONDS=30
+## Drift Monitor
+
+`GET /monitoring/drift` avalia:
+
+- PSI e Jensen-Shannon de features;
+- missingness;
+- volatilidade, volume e mudança de universo;
+- idade das previsões;
+- Brier e degradação contra referência;
+- ECE e gap de probabilidade;
+- expectativa e profit factor;
+- segmentos tóxicos.
+
+Thresholds ficam no `.env.example`, incluindo:
+
+```env
+DRIFT_PSI_WARN=0.10
+DRIFT_PSI_CRITICAL=0.25
+DRIFT_BRIER_WARN=0.22
+DRIFT_BRIER_CRITICAL=0.28
+DRIFT_ECE_WARN=0.08
+DRIFT_ECE_CRITICAL=0.15
+DRIFT_EXPECTANCY_WARN=0
+DRIFT_EXPECTANCY_CRITICAL=-0.20
+DRIFT_PROFIT_FACTOR_WARN=1.10
+DRIFT_PROFIT_FACTOR_CRITICAL=0.80
 ```
 
-Using the same physical Postgres avoids another database service. Schema
-isolation prevents Quant tables from mixing with backend tables. A dedicated
-Postgres role can be added later for stricter permissions without changing the
-application contract.
-
-## Current Limitations
-
-- SQLite is only the local fallback when PostgreSQL is not configured.
-- No authentication layer is currently enforced by this service.
-- CORS is permissive.
-- AI analysis depends on Anthropic API availability.
-- Recommendations are exposed through API but not yet enforced automatically by this service.
-
-## Next Technical Advances
-
-Priority improvements:
-
-- add auth token between backend and Quant Brain;
-- move `knowledge.db` to Postgres for durable cloud operation;
-- add endpoint for explicit gate recommendations;
-- add batch import from backend `telemetry.jsonl`;
-- add fee/slippage-aware PnL normalization;
-- add symbol toxicity scoring by rolling window;
-- add hour blacklist recommendation endpoint;
-- add BTC regime impact report by side;
-- add backtest-style gate rejection simulator;
-- add scheduled report export;
-- add dashboard integration for strategic insights.
-
-## Main Endpoints
-
-```text
-GET  /
-GET  /health
-
-GET  /market/snapshots
-GET  /market/snapshots/{symbol}
-GET  /market/anomalies
-
-GET  /tactical/alerts
-POST /tactical/analyze
-
-GET  /strategic/report
-GET  /strategic/edge-evolution
-POST /strategic/analyze
-POST /strategic/hypotheses
-
-GET  /kb/patterns
-GET  /kb/observations
-GET  /kb/insights
-GET  /kb/stats
-GET  /kb/stats/{symbol}
-POST /kb/trades
-GET  /kb/feature-history/{symbol}
-
-POST /recommend/entry
-GET  /simulate/gate-rejections
-```
+O `driftPolicy` pode reduzir stacking, impedir novas entradas ou desautorizar
+enforcement ML no backend.
 
 ## Champion/Challenger Governance
 
-Model authority is managed separately from training. The supported portfolio is:
+Portfólio suportado:
 
 - `deterministic_baseline`;
 - `current_champion`;
@@ -476,26 +300,12 @@ Model authority is managed separately from training. The supported portfolio is:
 - `stacking_policy_challenger`;
 - `early_exit_shadow_challenger`.
 
-Artifacts are stored by SHA-256 under `data/governance/artifacts`. Candidate
-registrations bind an artifact to explicit feature, label, and policy versions.
-Registrations and evidence are immutable; state changes are appended to
-`data/governance/audit.jsonl`.
+Artefatos são armazenados por SHA-256 sob `data/governance/artifacts`.
+Registros e evidências são imutáveis; transições vão para audit log.
 
-Evaluation uses chronological campaign-level walk-forward folds. Training rows
-whose labels overlap a validation boundary are purged. Confidence intervals are
-bootstrapped by independent campaign, not by correlated trade row. Promotion
-requires positive out-of-sample net VST expectancy, baseline improvement,
-controlled drawdown, calibration and reliability checks, and coverage across
-multiple symbols, sides, and regimes.
-
-The newest campaign partition is reserved as a fingerprinted final test set.
-Its metrics are not exposed by the selection endpoint, so thresholds and policy
-choices cannot be optimized against it.
-
-New campaign observations automatically monitor candidates in `review` or
-`champion`. Deteriorating expectancy, calibration, drawdown, or operational
-reliability returns the candidate to `shadow`. Promotion and rollback remain
-explicit, audited transitions.
+A avaliação usa campanhas cronológicas, purge de labels sobrepostas e bootstrap
+por campanha. A partição final é reservada e fingerprinted para reduzir
+otimização indevida contra o test set.
 
 ```text
 GET  /governance/status
@@ -505,3 +315,240 @@ POST /governance/evaluate/{candidate_id}
 POST /governance/promote/{candidate_id}
 POST /governance/rollback/{candidate_id}
 ```
+
+Promoção e rollback são explícitos e auditados.
+
+## Knowledge Base
+
+Backend de persistência:
+
+- PostgreSQL quando `QUANT_BRAIN_DATABASE_URL` ou `DATABASE_URL` existe;
+- SQLite `data/knowledge.db` como fallback local.
+
+PostgreSQL usa schema isolado:
+
+```env
+QUANT_BRAIN_DB_SCHEMA=quant_brain
+QUANT_BRAIN_DB_POOL_SIZE=5
+QUANT_BRAIN_DB_COMMAND_TIMEOUT=30
+```
+
+Categorias persistidas incluem:
+
+- feature snapshots;
+- observações e alertas;
+- outcomes de trade;
+- signal outcomes;
+- notícias;
+- qualidade de execução;
+- evidência de governança.
+
+Retenção:
+
+```env
+RETENTION_FEATURE_SNAPSHOTS_HOURS=24
+RETENTION_SIGNAL_OUTCOMES_DAYS=60
+RETENTION_NEWS_EVENTS_DAYS=3
+RETENTION_OBSERVATIONS_DAYS=14
+RETENTION_EXECUTION_QUALITY_DAYS=14
+RETENTION_TRADE_OUTCOMES_DAYS=0
+```
+
+`0` preserva trades realizados indefinidamente.
+
+## Runtime Jobs
+
+O `JobSupervisor` aplica concorrência limitada, prioridade, timeout, heartbeat,
+stale detection e lock de treinamento.
+
+| Job | Default | Papel |
+|---|---:|---|
+| tactical market cycle | `15s` | snapshots e alertas |
+| shadow signal sampler | `60s` | observações shadow |
+| model maintenance | `30s` no exemplo | finalização, treino e retenção |
+| macro candle regime | `900s` | contexto macro |
+| strategic loop | `6h` | relatório estratégico |
+
+Variáveis:
+
+```env
+JOB_MAX_CONCURRENCY=2
+JOB_STALE_AFTER_SECONDS=120
+TACTICAL_JOB_TIMEOUT_SECONDS=20
+SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS=25
+MODEL_JOB_TIMEOUT_SECONDS=45
+MACRO_CANDLE_JOB_TIMEOUT_SECONDS=30
+```
+
+## Saúde E Observabilidade
+
+```text
+GET /health/live   processo HTTP vivo
+GET /health/ready  runtime, snapshots e jobs prontos
+GET /health        visão consolidada
+GET /metrics       latência, erros, cache, jobs, DB e event loop
+```
+
+Railway deve usar `/health/live` como liveness. Um deployment pode aparecer
+running na UI da cloud e ainda devolver `502` se o processo falhou, reiniciou ou
+não está ouvindo em `$PORT`.
+
+## Autenticação E CORS
+
+Quando `QUANT_BRAIN_API_TOKEN` está definido, requisições mutáveis
+`POST/PUT/PATCH/DELETE` exigem:
+
+```text
+X-Quant-Brain-Token: <token>
+```
+
+ou:
+
+```text
+Authorization: Bearer <token>
+```
+
+GET/HEAD/OPTIONS permanecem legíveis para health e dashboards. O backend usa o
+mesmo token.
+
+`FRONTEND_URLS` controla CORS. Sem valor, a origem é `*`; isso deve ser evitado
+em exposição pública.
+
+## Integração Com O Backend
+
+Fluxos principais:
+
+```text
+POST /edge/evaluate
+POST /kb/trades
+POST /kb/trades/batch
+GET  /kb/trades/summary
+GET  /kb/trades/recent
+GET  /models/sniper/status
+GET  /signals/edge/{symbol}
+GET  /news/context/{symbol}
+GET  /health/live
+```
+
+Outcomes não entregues ficam na outbox persistente do backend e são reenviados
+em lote. O Quant Brain deve ser um sidecar degradável em `shadow`; em `enforce`,
+indisponibilidade bloqueia entradas.
+
+## Endpoints
+
+```text
+GET  /
+GET  /health
+GET  /health/live
+GET  /health/ready
+GET  /metrics
+
+GET  /market/snapshots
+GET  /market/snapshots/{symbol}
+GET  /market/anomalies
+GET  /market/macro-regime
+GET  /sniper/btc-commander
+GET  /sniper/evaluate/{symbol}
+
+GET  /tactical/alerts
+POST /tactical/analyze
+GET  /strategic/report
+GET  /strategic/edge-evolution
+POST /strategic/analyze
+POST /strategic/hypotheses
+
+GET  /kb/patterns
+GET  /kb/observations
+GET  /kb/insights
+GET  /kb/stats
+GET  /kb/stats/{symbol}
+POST /kb/trades
+POST /kb/trades/batch
+GET  /kb/trades/summary
+GET  /kb/trades/recent
+GET  /kb/feature-history/{symbol}
+
+POST /recommend/entry
+POST /edge/evaluate
+GET  /simulate/gate-rejections
+GET  /monitoring/drift
+
+POST /signals/finalize
+GET  /signals/edge/{symbol}
+GET  /signals/shadow-sampler/status
+POST /signals/shadow-sampler/run
+POST /models/sniper/train
+GET  /models/sniper/status
+
+POST /news/events
+GET  /news/context/{symbol}
+
+GET  /governance/status
+POST /governance/candidates
+POST /governance/observations
+POST /governance/evaluate/{candidate_id}
+POST /governance/promote/{candidate_id}
+POST /governance/rollback/{candidate_id}
+```
+
+## Rodar Local
+
+```powershell
+cd quant-brain
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env
+python main.py
+```
+
+Teste:
+
+```text
+GET http://localhost:9000/health/live
+GET http://localhost:9000/health/ready
+```
+
+## Deploy Railway
+
+```text
+Root Directory: quant-brain
+Start Command: python main.py
+Healthcheck Path: /health/live
+```
+
+Railway injeta `PORT`; `main.py` escuta em `0.0.0.0:$PORT`.
+
+Variáveis mínimas recomendadas:
+
+```env
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+QUANT_BRAIN_DB_SCHEMA=quant_brain
+QUANT_BRAIN_API_TOKEN=<segredo-compartilhado>
+FRONTEND_URLS=https://seu-dashboard.example
+```
+
+## Testes
+
+```powershell
+python -m pytest
+```
+
+A suíte cobre contrato, lifecycle shadow, qualidade de mercado, drift,
+governança, job supervisor, banco, calibração e regressões de runtime.
+
+## Dados Que Não Devem Ir Para Git
+
+```text
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+data/
+*.db
+*.db-journal
+*.log
+```
+
+Segredos exibidos em terminal, editor, screenshot ou chat devem ser revogados e
+substituídos.

@@ -13,7 +13,9 @@ from layers.strategic import build_strategic_report
 
 class RuntimeRegressionTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
+        tmp_root = Path(__file__).parent / ".tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        self.temp_dir = tempfile.TemporaryDirectory(dir=tmp_root)
         self.original_db_path = kb.DB_PATH
         kb.DB_PATH = Path(self.temp_dir.name) / "knowledge.db"
 

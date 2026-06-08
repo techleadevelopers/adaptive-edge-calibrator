@@ -4,7 +4,9 @@ import asyncio
 import math
 import random
 import time
+import uuid
 from datetime import datetime, timezone
+from core.market_data_quality import claim_event, validate_feature_contract
 from typing import Any
 
 from core.movement_sniper import evaluate_sniper_window
@@ -16,8 +18,13 @@ from core.signal_learning import (
     score_signal_context,
 )
 from core.shadow_model import predict_shadow
+from core.drift_monitor import evaluate_drift
 from core.database import connect
 from layers.tactical import get_snapshot_history
+
+CONTRACT_VERSION = "edge-v3"
+SUPPORTED_FEATURE_VERSIONS = {"sniper-v1", "candle-edge-v1"}
+PROBABILITY_DEFINITION = "probability_configured_target_hit_before_stop"
 
 
 def _target_moves(config: dict[str, Any]) -> dict[str, float]:
@@ -364,15 +371,94 @@ async def _get_recent_returns(symbol: str, side: str, days: int = 30) -> list[fl
 # ========== FUNÇÃO PRINCIPAL EXISTENTE (COM ADIÇÕES) ==========
 
 async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
+    contract_version = str(payload.get("contractVersion") or "")
+    if contract_version != CONTRACT_VERSION:
+        raise ValueError(f"incompatible contractVersion: {contract_version or 'missing'}")
     symbol = str(payload.get("symbol", "")).upper()
     if symbol and not symbol.endswith("-USDT"):
         symbol = f"{symbol}-USDT"
     position_side = _position_to_side(payload.get("positionSide"), payload.get("side"))
     side = str(payload.get("side", "")).upper()
+    if not symbol:
+        raise ValueError("symbol is required")
+    if position_side not in {"LONG", "SHORT"}:
+        raise ValueError("positionSide must be LONG or SHORT")
+    expected_side = "BUY" if position_side == "LONG" else "SELL"
+    if side != expected_side:
+        raise ValueError(f"side {side or 'missing'} is incompatible with {position_side}")
     now_hour = datetime.now(timezone.utc).hour
     hour_utc = int(payload.get("hourUtc", payload.get("hour_utc", now_hour)))
     config = payload.get("config") or {}
     gate_rejects: list[str] = []
+    gate_rejects.extend(validate_feature_contract(payload))
+
+    # ── Signal expiry check (contract v2) ──────────────────────────────────────
+    signal_id = str(payload.get("signalId") or "")
+    market_event_id = str(payload.get("marketEventId") or "")
+    feature_version = str(payload.get("featureVersion") or "")
+    if not signal_id or not market_event_id:
+        raise ValueError("signalId and marketEventId are required")
+    if feature_version not in SUPPORTED_FEATURE_VERSIONS:
+        raise ValueError(f"incompatible featureVersion: {feature_version or 'missing'}")
+    if market_event_id and not claim_event(str(market_event_id), position_side):
+        gate_rejects.append("DUPLICATE_EVENT_REJECT: market event already evaluated for this side")
+    expires_at_ms = payload.get("expiresAt")
+    if expires_at_ms is None:
+        raise ValueError("expiresAt is required")
+    if expires_at_ms is not None:
+        try:
+            if time.time() * 1000 > float(expires_at_ms):
+                return {
+                    "allow": False,
+                    "available": True,
+                    "contractVersion": CONTRACT_VERSION,
+                    "gateRejects": ["SIGNAL_EXPIRED: signal expired before QB evaluation"],
+                    "score": None,
+                    "authority": "quant-brain",
+                    "mode": "expired",
+                    "predictionId": f"prediction:{signal_id}",
+                    "signalId": signal_id,
+                    "marketEventId": market_event_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "positionSide": position_side,
+                    "featureVersion": feature_version,
+                    "modelVersion": None,
+                    "calibratedProbability": None,
+                    "probabilityDefinition": PROBABILITY_DEFINITION,
+                    "uncertaintyType": "MODEL_UNAVAILABLE",
+                    "predictionTimestamp": int(time.time() * 1000),
+                    "dataAgeMs": None,
+                }
+        except (TypeError, ValueError) as exc:
+            raise ValueError("expiresAt must be a Unix millisecond timestamp") from exc
+
+    # ── Sentiment context (24h directional bias from sentimentEngine.ts) ──────
+    sentiment_ctx = payload.get("sentimentContext") or {}
+    sentiment_direction = str(sentiment_ctx.get("direction", "NEUTRAL")).upper()
+    sentiment_confidence = float(sentiment_ctx.get("confidence") or 0)
+    sentiment_bias_ratio = float(sentiment_ctx.get("biasRatio") or 0.5)
+    # True when 24h bias matches the requested position side
+    sentiment_aligned = (
+        (position_side == "LONG" and sentiment_direction == "BULL")
+        or (position_side == "SHORT" and sentiment_direction == "BEAR")
+    )
+    # True when 24h bias strongly contradicts the requested side
+    sentiment_counter = (
+        (position_side == "LONG" and sentiment_direction == "BEAR")
+        or (position_side == "SHORT" and sentiment_direction == "BULL")
+    )
+    # Hard-block counter-trend entries only when sentiment is very confident
+    if (
+        sentiment_counter
+        and sentiment_confidence >= 0.75
+        and sentiment_bias_ratio >= 0.72
+    ):
+        gate_rejects.append(
+            f"SENTIMENT_COUNTER_REJECT: 24h bias {sentiment_direction} "
+            f"({sentiment_confidence:.0%} conf, {sentiment_bias_ratio:.0%} weight) "
+            f"conflicts with {position_side}"
+        )
 
     # ========== GATES EXISTENTES (MANTIDOS) ==========
     allowed_symbols = _list(config.get("allowedSymbols"))
@@ -417,6 +503,15 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
 
     alt_history = get_snapshot_history(symbol, 900)
     btc_history = get_snapshot_history("BTC-USDT", 900)
+    reference_price = _num(payload.get("referencePrice"), 0.0)
+    if reference_price > 0 and alt_history:
+        quant_price = _num(alt_history[-1].get("price"), 0.0)
+        if quant_price > 0:
+            divergence_pct = abs(reference_price - quant_price) / quant_price * 100
+            if divergence_pct > 0.5:
+                gate_rejects.append(
+                    f"SNAPSHOT_CONFLICT_REJECT: backend/quant price divergence {divergence_pct:.3f}%"
+                )
     target_moves_pct = _target_moves(config)
     sniper = evaluate_sniper_window(
         symbol,
@@ -424,7 +519,15 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         btc_history,
         target_moves_pct=target_moves_pct,
     )
-    signal_memory = await record_signal_from_gate(symbol, position_side, sniper, config)
+    signal_memory = await record_signal_from_gate(
+        symbol,
+        position_side,
+        sniper,
+        config,
+        signal_id=str(signal_id) if signal_id else None,
+        feature_version=str(feature_version),
+        source_type=str(payload.get("observationSourceType") or "hypothetical"),
+    )
     signal_edge = await score_signal_context(symbol, signal_memory["side"], signal_memory["contextKey"])
     news_context = await kb.get_active_news_context(symbol)
     operational_risk = await kb.get_operational_risk_metrics(hours=24)
@@ -440,7 +543,8 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         gate_rejects.append("DATA_STALE_REJECT: market snapshots are stale")
     if any(frame["quality"] == "GAPPED" for frame in data_quality.values()):
         gate_rejects.append("DATA_GAP_REJECT: snapshot continuity is degraded")
-    if _bool(config.get("requireFull15mContext"), True):
+    # requireFull15mContext defaults False so startup doesn't block for 15min
+    if _bool(config.get("requireFull15mContext"), False):
         if (
             data_quality["alt15m"]["coveragePct"] < 0.8
             or data_quality["btc15m"]["coveragePct"] < 0.8
@@ -510,14 +614,33 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "alt_timeframes": sniper["altTimeframes"],
         },
     })
+    prediction_timestamp_seconds = time.time()
+    prediction_timestamp = int(prediction_timestamp_seconds * 1000)
+    await kb.record_signal_prediction(
+        signal_memory["signalId"],
+        shadow_ml.get("calibratedProbability"),
+        prediction_timestamp_seconds,
+        shadow_ml.get("modelVersion"),
+    )
+    drift = await evaluate_drift(now=prediction_timestamp_seconds)
+    drift_policy = drift["policy"]
 
     # NOVO: Shadow ML com limiar mais rigoroso
     if (
         _bool(config.get("shadowMlEnforce"), False)
-        and shadow_ml.get("available")
-        and shadow_ml.get("calibratedProbability", 0) < 0.52
+        and drift_policy["mlEnforcementAllowed"]
+        and not shadow_ml.get("available")
+    ):
+        gate_rejects.append("SHADOW_ML_UNAVAILABLE_REJECT: calibrated prediction unavailable")
+    elif (
+        _bool(config.get("shadowMlEnforce"), False)
+        and drift_policy["mlEnforcementAllowed"]
+        and shadow_ml.get("calibratedProbability") is not None
+        and shadow_ml["calibratedProbability"] < 0.52
     ):
         gate_rejects.append(f"SHADOW_ML_REJECT: prob {shadow_ml['calibratedProbability']:.3f} < 0.52")
+    if not drift_policy["newEntriesAllowed"]:
+        gate_rejects.append(f"DRIFT_PAUSED_REJECT: state {drift['state']} blocks new entries")
 
     if news_context["action"] == "block":
         gate_rejects.append("NEWS_RISK_REJECT: active high-impact event blocks entries")
@@ -543,15 +666,17 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     volatility_regime, current_vol, vol_history = _calculate_volatility_regime_from_history(alt_history)
     adjusted_stop = _calculate_volatility_adjusted_stop(current_vol, stop_move_pct, volatility_regime)
 
-    if volatility_regime == "HIGH" and current_vol > 1.5:
-        gate_rejects.append(f"HIGH_VOLATILITY_REJECT: current vol {current_vol:.2f}% > 1.5%")
+    # Threshold 2.5% to allow normal alt-coin volatility without blocking
+    if volatility_regime == "HIGH" and current_vol > 2.5:
+        gate_rejects.append(f"HIGH_VOLATILITY_REJECT: current vol {current_vol:.2f}% > 2.5%")
 
     # 2. Sharpe Ratio de trades realizados
     recent_returns = await _get_recent_returns(symbol, position_side, days=30)
     realized_sharpe = _calculate_sharpe_from_trades(recent_returns)
 
-    if len(recent_returns) >= 10 and realized_sharpe < 0.5:
-        gate_rejects.append(f"LOW_REALIZED_SHARPE_REJECT: Sharpe {realized_sharpe:.2f} < 0.5")
+    # min 25 samples before Sharpe gate activates; threshold 0.3 to avoid blocking early-stage operation
+    if len(recent_returns) >= 25 and realized_sharpe < 0.3:
+        gate_rejects.append(f"LOW_REALIZED_SHARPE_REJECT: Sharpe {realized_sharpe:.2f} < 0.3")
 
     # 3. Correlação e Penalidade
     correlation = _calculate_correlation_from_history(alt_history, btc_history)
@@ -574,7 +699,8 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         btc_regime, current_vol * 2, btc_trend_strength, correlation
     )
 
-    if regime_confidence["regime_confidence"] < 0.5:
+    # Threshold 0.4 to allow entries in ambiguous but not chaotic regimes
+    if regime_confidence["regime_confidence"] < 0.4:
         gate_rejects.append(f"LOW_REGIME_CONFIDENCE: confidence {regime_confidence['regime_confidence']:.2f}")
 
     # 5. Bootstrap EV Confidence
@@ -645,17 +771,55 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     if samples < recommendation.get("minSamplesForLiveGate", 8):
         score = min(float(sniper.get("score", 0.0)), float(signal_edge.get("score", 0.5)))
 
+    # ── Sentiment alignment adjustment ──────────────────────────────────────────
+    # Aligned 24h bias boosts score; counter-bias penalises it.
+    if sentiment_aligned and sentiment_confidence > 0.3:
+        score = min(1.0, score * (1.0 + sentiment_confidence * 0.15))
+    elif sentiment_counter and sentiment_confidence > 0.3:
+        score = score * (1.0 - sentiment_confidence * 0.10)
+
+    # ── Contract v2 audit fields from shadow ML ────────────────────────────────
+    ml_model_version: str = shadow_ml.get("modelVersion", "shadow-unknown")
+    ml_calibrated_prob: float | None = shadow_ml.get("calibratedProbability")
+    if shadow_ml.get("available"):
+        ml_uncertainty_type = shadow_ml.get("uncertaintyType", "UNCALIBRATED")
+    else:
+        ml_uncertainty_type = "MODEL_UNAVAILABLE"
+
     # ========== NOVOS CAMPOS NO RETORNO ==========
     return {
         "allow": allow,
         "gateRejects": gate_rejects,
         "score": round(score, 4),
         "authority": "quant-brain",
+        "available": True,
+        "contractVersion": CONTRACT_VERSION,
+        "predictionId": str(uuid.uuid4()),
+        # Contract v2 — provenance & ML audit
+        "signalId": signal_id,
+        "marketEventId": market_event_id,
+        "featureVersion": feature_version,
+        "modelVersion": ml_model_version,
+        "calibratedProbability": round(ml_calibrated_prob, 6) if ml_calibrated_prob is not None else None,
+        "probabilityDefinition": PROBABILITY_DEFINITION,
+        "uncertaintyType": ml_uncertainty_type,
+        "predictionTimestamp": prediction_timestamp,
+        "dataAgeMs": max(
+            0,
+            prediction_timestamp - int(payload.get("featureTimestampMs") or prediction_timestamp),
+        ),
         "symbol": symbol,
         "side": side,
         "positionSide": position_side,
         "hourUtc": hour_utc,
         "btcRegime": btc_regime,
+        "sentimentContext": {
+            "direction": sentiment_direction,
+            "confidence": round(sentiment_confidence, 3),
+            "biasRatio": round(sentiment_bias_ratio, 3),
+            "aligned": sentiment_aligned,
+            "counter": sentiment_counter,
+        },
         "sniper": sniper,
         "signalMemory": signal_memory,
         "signalEdge": signal_edge,
@@ -675,6 +839,8 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         "dataQuality": data_quality,
         "operationalRisk": operational_risk,
         "shadowMl": shadow_ml,
+        "drift": drift,
+        "driftPolicy": drift_policy,
         "realizedEdge": recommendation,
         # NOVOS CAMPOS DE INTELIGÊNCIA
         "advancedMetrics": {

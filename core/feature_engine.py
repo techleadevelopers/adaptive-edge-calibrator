@@ -17,6 +17,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 import httpx
+from core.market_data_quality import SnapshotTracker, sanitize_candles
 
 BINGX_BASE = "https://open-api.bingx.com"
 HTTP_CONCURRENCY = max(1, int(os.environ.get("FEATURE_HTTP_CONCURRENCY", "8")))
@@ -64,6 +65,10 @@ class MarketSnapshot:
     latency_ms: float = 0.0        # latência da requisição
     data_quality_score: float = 1.0  # 0-1
     price_confidence: float = 1.0  # 0-1 baseado em profundidade
+    source_timestamp: float = 0.0
+    market_event_id: str = ""
+    freshness_seconds: float = 0.0
+    data_quality_incidents: list[str] = field(default_factory=list)
 
 
 class FeatureEngine:
@@ -87,6 +92,9 @@ class FeatureEngine:
         self._websocket_connected: bool = False
         self._http_semaphore = asyncio.Semaphore(HTTP_CONCURRENCY)
         self._snapshot_semaphore = asyncio.Semaphore(SNAPSHOT_CONCURRENCY)
+        self._snapshot_tracker = SnapshotTracker(
+            expected_interval_seconds=max(5.0, float(os.environ.get("TACTICAL_LOOP_SECONDS", "15")))
+        )
 
     def on_snapshot(self, fn):
         self._callbacks.append(fn)
@@ -161,7 +169,8 @@ class FeatureEngine:
         data = r.get("data", [])
         if not isinstance(data, list):
             return []
-        return [item for item in data if isinstance(item, dict)]
+        quality = sanitize_candles(symbol, interval, [item for item in data if isinstance(item, dict)])
+        return quality["completed"]
 
     async def fetch_orderbook(self, symbol: str, depth: int = 10) -> tuple[float, float, float, float, float, float]:
         """
@@ -496,6 +505,17 @@ class FeatureEngine:
             volume_ratio = volume_24h / avg_vol if avg_vol > 0 else 1.0
         except Exception:
             return None
+        received_at = time.time()
+        raw_source_ts = ticker.get("time", ticker.get("timestamp", received_at))
+        try:
+            source_timestamp = float(raw_source_ts)
+            if source_timestamp > 10_000_000_000:
+                source_timestamp /= 1000
+        except (TypeError, ValueError):
+            source_timestamp = received_at
+        snapshot_quality = self._snapshot_tracker.accept(symbol, source_timestamp, received_at)
+        if not snapshot_quality.accepted:
+            return None
 
         # Spreads
         spread_bps = ((ask - bid) / price * 10000) if price > 0 and ask > bid else 0.0
@@ -607,6 +627,16 @@ class FeatureEngine:
             latency_ms=latency_ms,
             data_quality_score=data_quality_score,
             price_confidence=price_confidence,
+            source_timestamp=source_timestamp,
+            market_event_id=f"md:v1:bingx:{symbol}:snapshot:{int(source_timestamp * 1000)}",
+            freshness_seconds=snapshot_quality.freshness_seconds,
+            data_quality_incidents=[
+                name for name, active in (
+                    ("GAP", snapshot_quality.gap_seconds > self._snapshot_tracker.expected_interval_seconds * 2),
+                    ("RECOVERED", snapshot_quality.recovered),
+                    ("STALE", snapshot_quality.freshness_seconds > self._snapshot_tracker.expected_interval_seconds * 2),
+                ) if active
+            ],
         )
 
         snap.anomalies = self._detect_anomalies(snap)
@@ -682,6 +712,10 @@ class FeatureEngine:
             "latency_ms": snap.latency_ms,
             "data_quality_score": snap.data_quality_score,
             "price_confidence": snap.price_confidence,
+            "source_timestamp": snap.source_timestamp,
+            "market_event_id": snap.market_event_id,
+            "freshness_seconds": snap.freshness_seconds,
+            "data_quality_incidents": snap.data_quality_incidents,
         }
 
     async def close(self):

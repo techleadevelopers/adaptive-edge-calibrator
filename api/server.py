@@ -151,10 +151,7 @@ def trade_payload_to_record_args(payload: dict, experiment: dict | None = None) 
         pnl_pct = (realized_pnl / margin_used * 100) if margin_used > 0 else realized_pnl
 
     pnl_usdt = _first_payload_value(payload, "pnl_usdt", "realizedPnl", "realized_pnl", default=0)
-    policy_version = (
-        _first_payload_value(payload, "policyVersion", "policy_version")
-        or experiment.get("policyVersion")
-    )
+    policy_version = _first_payload_value(payload, "policyVersion", "policy_version")
 
     return {
         "source_id": _payload_source_id(payload) or None,
@@ -990,6 +987,8 @@ async def record_trades_batch(body: list[dict]):
         experiment = await infer_assignment_for_outcome(item) or {}
         duplicate = await _trade_outcome_exists(source_id)
         record_args = trade_payload_to_record_args(item, experiment)
+        if duplicate and _first_payload_value(item, "policyVersion", "policy_version") is None:
+            record_args["policy_version"] = None
         recorded = await kb.record_trade_outcome(**record_args)
         audit = await record_trade_audit(item)
         results.append({

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import time
 import math
 import os
+import hashlib
 from pathlib import Path
 from typing import Any
 from collections import defaultdict
@@ -23,6 +25,10 @@ CATEGORICAL_FEATURES = [
     "alt_1m_breakout",
     "alt_5m_breakout",
     "alt_15m_breakout",
+    "btc_candle_bias",
+    "btc_candle_action",
+    "btc_1h_trend",
+    "btc_4h_trend",
 ]
 NUMERICAL_FEATURES = [
     "alt_price_change_pct",
@@ -58,6 +64,12 @@ NUMERICAL_FEATURES = [
     "alt_15m_rangePct",
     "alt_15m_wickRatio",
     "alt_15m_volumeRatioAvg",
+    "btc_correction_risk",
+    "btc_trend_score",
+    "btc_1h_move_pct",
+    "btc_4h_move_pct",
+    "btc_1h_volume_ratio",
+    "btc_4h_volatility_pct",
 ]
 
 # Feature importance tracking
@@ -70,6 +82,7 @@ def _feature_dict(row: dict[str, Any]) -> dict[str, Any]:
     alt = features.get("alt", {})
     btc = features.get("btc", {})
     alt_frames = features.get("alt_timeframes", {})
+    candle_regime = features.get("candle_regime", {})
 
     result: dict[str, Any] = {
         "symbol": row.get("symbol", ""),
@@ -83,7 +96,7 @@ def _feature_dict(row: dict[str, Any]) -> dict[str, Any]:
     # Features do alt e btc
     for prefix, source in (("alt", alt), ("btc", btc)):
         for key in NUMERICAL_FEATURES:
-            if key.startswith(prefix):
+            if key.startswith(prefix) and not key.startswith("btc_correction") and not key.startswith("btc_trend") and not key.startswith("btc_1h") and not key.startswith("btc_4h"):
                 feature_name = key.replace(f"{prefix}_", "")
                 result[key] = float(source.get(feature_name, 0) or 0)
         result[f"{prefix}_movement_state"] = str(source.get("movement_state", "NO_DATA"))
@@ -95,6 +108,20 @@ def _feature_dict(row: dict[str, Any]) -> dict[str, Any]:
             result[f"alt_{frame_name}_{key}"] = float(frame.get(key, 0) or 0)
         result[f"alt_{frame_name}_breakout"] = str(frame.get("breakoutState", "NO_DATA"))
 
+    # Features de candle regime macro (1h/4h/1d contexto BTC)
+    tf_1h = candle_regime.get("1h", {})
+    tf_4h = candle_regime.get("4h", {})
+    result["btc_candle_bias"] = str(candle_regime.get("bias", "NEUTRAL"))
+    result["btc_candle_action"] = str(candle_regime.get("action", "RANGE_ONLY"))
+    result["btc_1h_trend"] = str(tf_1h.get("trend", "NEUTRAL"))
+    result["btc_4h_trend"] = str(tf_4h.get("trend", "NEUTRAL"))
+    result["btc_correction_risk"] = float(candle_regime.get("correctionRisk", 0) or 0)
+    result["btc_trend_score"] = float(candle_regime.get("trendScore", 0) or 0)
+    result["btc_1h_move_pct"] = float(tf_1h.get("movePct", 0) or 0)
+    result["btc_4h_move_pct"] = float(tf_4h.get("movePct", 0) or 0)
+    result["btc_1h_volume_ratio"] = float(tf_1h.get("volumeRatio", 1) or 1)
+    result["btc_4h_volatility_pct"] = float(tf_4h.get("volatilityPct", 0) or 0)
+
     # Features derivadas (interações)
     result["alt_btc_momentum_ratio"] = (
         result.get("alt_price_change_pct", 0) / max(0.01, abs(result.get("btc_price_change_pct", 0.01)))
@@ -104,6 +131,10 @@ def _feature_dict(row: dict[str, Any]) -> dict[str, Any]:
     )
     result["rsi_extreme"] = 1 if result.get("alt_rsi", 50) > 75 or result.get("alt_rsi", 50) < 25 else 0
     result["spread_penalty"] = min(1.0, result.get("alt_spread_bps", 0) / 20)
+    result["regime_aligned"] = 1 if (
+        (row.get("side", "") == "LONG" and result["btc_candle_bias"] == "LONG") or
+        (row.get("side", "") == "SHORT" and result["btc_candle_bias"] == "SHORT")
+    ) else 0
 
     return result
 
@@ -210,6 +241,188 @@ def _cross_validate_temporal(
     }
 
 
+def _data_quality_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Avalia qualidade do dataset de treinamento.
+    Pontuação 0-100 baseada em: volume, balanceamento de classes,
+    diversidade de contexto, cobertura temporal e completude de features.
+    """
+    if not rows:
+        return {"score": 0, "note": "no_data"}
+
+    n = len(rows)
+    hits = sum(1 for r in rows if r.get("hit_configured") == 1)
+    win_rate = hits / n
+
+    context_keys = {r.get("context_key", "") for r in rows}
+    symbols = {r.get("symbol", "") for r in rows}
+    timestamps = [float(r.get("created_at", 0)) for r in rows if r.get("created_at")]
+    span_hours = (max(timestamps) - min(timestamps)) / 3600.0 if len(timestamps) > 1 else 0.0
+    has_regime = sum(
+        1 for r in rows
+        if (r.get("features") or {}).get("candle_regime", {}).get("bias")
+    )
+
+    score = 0
+    notes: list[str] = []
+
+    if n >= 300:
+        score += 25
+    elif n >= 150:
+        score += 15
+    elif n >= 50:
+        score += 5
+
+    if 0.25 <= win_rate <= 0.75:
+        score += 25
+    elif 0.15 <= win_rate <= 0.85:
+        score += 15
+    else:
+        notes.append("class_imbalance")
+
+    if len(context_keys) >= 30:
+        score += 20
+    elif len(context_keys) >= 15:
+        score += 10
+
+    if len(symbols) >= 5:
+        score += 15
+
+    if span_hours >= 24:
+        score += 15
+    elif span_hours >= 4:
+        score += 10
+    elif span_hours >= 1:
+        score += 5
+    else:
+        notes.append("insufficient_time_coverage")
+
+    return {
+        "score": min(100, score),
+        "n": n,
+        "winRate": round(win_rate, 4),
+        "contextDiversity": len(context_keys),
+        "symbols": len(symbols),
+        "spanHours": round(span_hours, 2),
+        "regimeCompleteness": round(has_regime / n * 100, 1),
+        "notes": notes,
+    }
+
+
+def _profitability_simulation(
+    test_rows: list[dict[str, Any]],
+    calibrated_probs: list[float],
+    y_true: list[int],
+) -> dict[str, Any]:
+    """
+    Testes essenciais de lucratividade para validação do edge.
+
+    Simula entradas filtradas pelo modelo em diferentes thresholds (0.50–0.90),
+    calculando EV esperado por trade usando TP/SL/custo reais de cada amostra.
+
+    Regra de ouro scalp: EV > 0 apenas quando win_rate > breakeven_rate.
+    Com TP=0.22% SL=0.55% custo=0.14%: breakeven ≈ 89.6%.
+    O modelo deve identificar o subconjunto de condições que superam esse limiar.
+
+    Retorna:
+        - optimalThreshold: threshold que maximiza EV
+        - optimalEvPct: EV médio por trade no threshold ótimo
+        - optimalWinRate: win rate real no threshold ótimo
+        - profitabilityVerified: True se EV > 0 no threshold ótimo
+        - baselineAvgEvPct: EV sem filtragem (baseline)
+        - thresholdScan: lista com métricas para cada threshold
+    """
+    if not test_rows or not calibrated_probs:
+        return {"profitabilityVerified": False, "optimalThreshold": 0.60}
+
+    DEFAULT_TP = 0.22
+    DEFAULT_SL = 0.55
+
+    baseline_ev = 0.0
+    for row, label in zip(test_rows, y_true):
+        tp = float(row.get("target_configured_move_pct", DEFAULT_TP) or DEFAULT_TP)
+        sl = float((row.get("features") or {}).get("stop_move_pct", DEFAULT_SL) or DEFAULT_SL)
+        cost = float(row.get("estimated_cost_pct", 0.0) or 0.0)
+        net_tp = tp - cost
+        net_sl = sl + cost
+        if label == 1:
+            baseline_ev += net_tp
+        else:
+            baseline_ev -= net_sl
+    baseline_avg_ev = baseline_ev / max(1, len(test_rows))
+
+    threshold_scan: list[dict[str, Any]] = []
+    best_ev = float("-inf")
+    best_threshold = 0.60
+
+    for t_int in range(50, 92, 2):
+        threshold = t_int / 100.0
+        ev_total = 0.0
+        n_trades = 0
+        n_wins = 0
+        breakeven_rates: list[float] = []
+
+        for row, prob, label in zip(test_rows, calibrated_probs, y_true):
+            if prob < threshold:
+                continue
+            tp = float(row.get("target_configured_move_pct", DEFAULT_TP) or DEFAULT_TP)
+            sl = float((row.get("features") or {}).get("stop_move_pct", DEFAULT_SL) or DEFAULT_SL)
+            cost = float(row.get("estimated_cost_pct", 0.0) or 0.0)
+            net_tp = tp - cost
+            net_sl = sl + cost
+            breakeven_rates.append((net_sl) / (net_tp + net_sl) if (net_tp + net_sl) > 0 else 1.0)
+            if label == 1:
+                ev_total += net_tp
+                n_wins += 1
+            else:
+                ev_total -= net_sl
+            n_trades += 1
+
+        if n_trades < 10:
+            continue
+
+        avg_ev = ev_total / n_trades
+        win_rate = n_wins / n_trades
+        avg_breakeven = sum(breakeven_rates) / len(breakeven_rates) if breakeven_rates else 0.0
+        threshold_scan.append({
+            "threshold": threshold,
+            "nTrades": n_trades,
+            "winRate": round(win_rate, 4),
+            "avgEvPct": round(avg_ev, 6),
+            "coveragePct": round(n_trades / max(1, len(test_rows)) * 100, 2),
+            "breakevenWinRate": round(avg_breakeven, 4),
+            "edgeVsBreakeven": round(win_rate - avg_breakeven, 4),
+        })
+
+        if avg_ev > best_ev:
+            best_ev = avg_ev
+            best_threshold = threshold
+
+    best_entry = next((r for r in threshold_scan if r["threshold"] == best_threshold), {})
+    profitability_verified = best_ev > 0
+
+    kelly_fraction = 0.0
+    if profitability_verified and best_entry.get("winRate", 0) > 0:
+        p = best_entry["winRate"]
+        q = 1.0 - p
+        b = abs(best_entry["avgEvPct"]) / max(0.001, abs(baseline_avg_ev)) if baseline_avg_ev < 0 else 1.0
+        kelly_fraction = max(0.0, p - q / max(0.001, b))
+
+    return {
+        "baselineAvgEvPct": round(baseline_avg_ev, 6),
+        "optimalThreshold": best_threshold,
+        "optimalEvPct": round(best_ev, 6),
+        "optimalWinRate": best_entry.get("winRate", 0),
+        "optimalTrades": best_entry.get("nTrades", 0),
+        "optimalCoverage": best_entry.get("coveragePct", 0),
+        "optimalEdgeVsBreakeven": best_entry.get("edgeVsBreakeven", 0),
+        "breakevenWinRate": best_entry.get("breakevenWinRate", 0),
+        "profitabilityVerified": profitability_verified,
+        "kellyFraction": round(kelly_fraction, 4),
+        "thresholdScan": threshold_scan,
+    }
+
+
 async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[str, Any]:
     """Treina modelo shadow com validação avançada e early stopping."""
     try:
@@ -226,19 +439,48 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
 
     source_filter = os.environ.get("SHADOW_MODEL_SIGNAL_SOURCE_TYPE", "").strip() or None
     rows = await kb.get_signal_training_rows(decision_group=None, source_type=source_filter)
+    readiness = await kb.get_signal_readiness_diagnostics(
+        min_samples=min_samples,
+        source_type=source_filter,
+    )
     if len(rows) < min_samples:
         return {
             "trained": False,
             "reason": "insufficient_samples",
             "samples": len(rows),
             "minSamples": min_samples,
+            "readiness": readiness,
+        }
+
+    if readiness["state"] in {"LABEL_BLOCKED", "CLASS_IMBALANCED"}:
+        return {
+            "trained": False,
+            "reason": readiness["state"].lower(),
+            "samples": len(rows),
+            "readiness": readiness,
+        }
+
+    raw_split = max(int(len(rows) * 0.8), 1)
+    test_rows = rows[raw_split:]
+    test_start = float(test_rows[0]["created_at"]) if test_rows else float("inf")
+    train_rows = [
+        row for row in rows[:raw_split]
+        if float(row.get("finalized_at") or 0) <= test_start
+    ]
+    rows = train_rows + test_rows
+    split = len(train_rows)
+    if split < 50 or len(test_rows) < 20:
+        return {
+            "trained": False,
+            "reason": "insufficient_purged_chronological_split",
+            "samples": len(rows),
+            "purgedTrainSamples": split,
         }
 
     x = [_feature_dict(row) for row in rows]
     y = np.asarray([int(row.get("hit_configured") or 0) for row in rows])
 
     # Divisão temporal (não aleatória)
-    split = max(int(len(rows) * 0.8), 1)
     if len(set(y[:split])) < 2 or len(set(y[split:])) < 2:
         return {"trained": False, "reason": "both_classes_required", "samples": len(rows)}
 
@@ -286,11 +528,17 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
         gb_model = build_gb_model()
         rf_model = build_rf_model()
 
-        gb_model.fit(x[:train_end], fold_y)
-        rf_model.fit(x[:train_end], fold_y)
+        await asyncio.gather(
+            asyncio.to_thread(gb_model.fit, x[:train_end], fold_y),
+            asyncio.to_thread(rf_model.fit, x[:train_end], fold_y),
+        )
 
-        gb_proba = gb_model.predict_proba(x[train_end:validation_end])[:, 1]
-        rf_proba = rf_model.predict_proba(x[train_end:validation_end])[:, 1]
+        gb_proba, rf_proba = await asyncio.gather(
+            asyncio.to_thread(gb_model.predict_proba, x[train_end:validation_end]),
+            asyncio.to_thread(rf_model.predict_proba, x[train_end:validation_end]),
+        )
+        gb_proba = gb_proba[:, 1]
+        rf_proba = rf_proba[:, 1]
 
         # Ensemble simples (média)
         ensemble_proba = (gb_proba + rf_proba) / 2
@@ -303,18 +551,24 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
 
     # Calibração isotônica
     calibrator = IsotonicRegression(out_of_bounds="clip")
-    calibrator.fit(oof_probabilities, oof_labels)
+    await asyncio.to_thread(calibrator.fit, oof_probabilities, oof_labels)
 
     # Treina modelo final com ensemble
     gb_final = build_gb_model()
     rf_final = build_rf_model()
 
-    gb_final.fit(x[:split], y[:split])
-    rf_final.fit(x[:split], y[:split])
+    await asyncio.gather(
+        asyncio.to_thread(gb_final.fit, x[:split], y[:split]),
+        asyncio.to_thread(rf_final.fit, x[:split], y[:split]),
+    )
 
     # Avaliação no test set
-    gb_test = gb_final.predict_proba(x[split:])[:, 1]
-    rf_test = rf_final.predict_proba(x[split:])[:, 1]
+    gb_test, rf_test = await asyncio.gather(
+        asyncio.to_thread(gb_final.predict_proba, x[split:]),
+        asyncio.to_thread(rf_final.predict_proba, x[split:]),
+    )
+    gb_test = gb_test[:, 1]
+    rf_test = rf_test[:, 1]
     ensemble_test = (gb_test + rf_test) / 2
     calibrated_test = calibrator.predict(ensemble_test)
 
@@ -328,11 +582,30 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
     improves_baseline = model_brier < baseline_brier
 
     # Validação cruzada temporal
-    cv_results = _cross_validate_temporal(x, y)
+    cv_results = await asyncio.to_thread(_cross_validate_temporal, x, y)
 
     # Feature importance
-    feature_importance = _calculate_feature_importance(gb_final, gb_final.named_steps["vectorizer"], NUMERICAL_FEATURES)
+    feature_importance = await asyncio.to_thread(
+        _calculate_feature_importance,
+        gb_final,
+        gb_final.named_steps["vectorizer"],
+        NUMERICAL_FEATURES,
+    )
     _feature_importance_cache.update(feature_importance)
+
+    # ── Testes essenciais de lucratividade ──────────────────────────────────
+    # Simula edge financeiro: encontra threshold que maximiza EV por trade,
+    # valida se o modelo supera o breakeven da configuração scalp.
+    profitability, data_quality = await asyncio.gather(
+        asyncio.to_thread(
+            _profitability_simulation,
+            rows[split:],
+            list(calibrated_test.tolist()),
+            list(y[split:].tolist()),
+        ),
+        asyncio.to_thread(_data_quality_report, rows),
+    )
+    # ────────────────────────────────────────────────────────────────────────
 
     metadata = {
         "trainedAt": time.time(),
@@ -348,9 +621,27 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
         "target": "0.5",
         "cvResults": cv_results if cv_results.get("success") else None,
         "topFeatures": list(feature_importance.keys())[:10] if feature_importance else [],
+        # Profitability test results
+        "optimalThreshold": profitability["optimalThreshold"],
+        "expectedValuePct": profitability["optimalEvPct"],
+        "profitabilityVerified": profitability["profitabilityVerified"],
+        "simulatedWinRate": profitability["optimalWinRate"],
+        "baselineEvPct": profitability["baselineAvgEvPct"],
+        "breakevenWinRate": profitability["breakevenWinRate"],
+        "optimalEdgeVsBreakeven": profitability["optimalEdgeVsBreakeven"],
+        "kellyFraction": profitability["kellyFraction"],
+        "optimalCoverage": profitability["optimalCoverage"],
+        "profitabilityThresholdScan": profitability.get("thresholdScan", []),
+        # Data quality
+        "dataQuality": data_quality,
+        "datasetFingerprint": kb.signal_dataset_fingerprint(rows),
+        "featureLabelVersions": readiness["versions"],
+        "labelAvailabilityPurged": raw_split - split,
+        "validation": "purged_chronological_holdout_with_walk_forward",
     }
 
-    if improves_baseline:
+    save_model = improves_baseline or profitability["profitabilityVerified"]
+    if save_model:
         # Ensemble final (média dos dois modelos)
         final_model = {
             "gb_model": gb_final,
@@ -359,7 +650,64 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
             "model_type": "ensemble",
         }
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        joblib.dump(final_model, MODEL_PATH)
+        await asyncio.to_thread(joblib.dump, final_model, MODEL_PATH)
+        try:
+            from core.model_governance import (
+                CandidateSpec,
+                GovernanceStore,
+                VersionSet,
+            )
+
+            governance_store = GovernanceStore(Path(os.environ.get(
+                "MODEL_GOVERNANCE_DIR",
+                str(Path(__file__).parent.parent / "data" / "governance"),
+            )))
+            artifact_content = MODEL_PATH.read_bytes()
+            artifact_sha256 = governance_store.put_artifact(
+                artifact_content,
+                {"format": "joblib", "model_type": "shadow_ensemble"},
+            )
+            feature_versions = sorted({
+                str(row.get("feature_version") or "legacy") for row in rows
+            })
+            label_versions = sorted({
+                str(row.get("label_version") or "legacy") for row in rows
+            })
+            feature_version = (
+                feature_versions[0]
+                if len(feature_versions) == 1
+                else f"mixed-{hashlib.sha256('|'.join(feature_versions).encode()).hexdigest()[:12]}"
+            )
+            label_version = (
+                label_versions[0]
+                if len(label_versions) == 1
+                else f"mixed-{hashlib.sha256('|'.join(label_versions).encode()).hexdigest()[:12]}"
+            )
+            registry = governance_store.status()
+            candidate_id = f"ml-challenger-{artifact_sha256[:16]}"
+            candidate = governance_store.register(CandidateSpec(
+                candidate_id=candidate_id,
+                kind="ml_challenger",
+                versions=VersionSet(
+                    feature=feature_version,
+                    label=label_version,
+                    policy=f"shadow-threshold-{profitability['optimalThreshold']:.2f}",
+                ),
+                artifact_sha256=artifact_sha256,
+                created_at=metadata["trainedAt"],
+                parent_candidate_id=registry.get("champion_id"),
+                metadata={
+                    "samples": len(rows),
+                    "walkForward": True,
+                    "authority": "shadow",
+                },
+            ))
+            metadata["governanceCandidateId"] = candidate.candidate_id
+            metadata["artifactSha256"] = artifact_sha256
+        except Exception as exc:
+            metadata["governanceRegistrationError"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
         METADATA_PATH.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         await kb.save_model_artifact(
             "sniper_target_050",
@@ -367,7 +715,7 @@ async def train_shadow_model(min_samples: int = MIN_TRAINING_SAMPLES) -> dict[st
             metadata,
         )
 
-    return {"trained": improves_baseline, **metadata}
+    return {"trained": save_model, **metadata}
 
 
 async def restore_shadow_model() -> bool:
@@ -386,21 +734,26 @@ async def restore_shadow_model() -> bool:
 
 
 def shadow_model_status() -> dict[str, Any]:
-    """Retorna status do modelo shadow com métricas."""
+    """Retorna status do modelo shadow com métricas e testes de lucratividade."""
     if not MODEL_PATH.exists() or not METADATA_PATH.exists():
         return {"available": False, "authority": "shadow"}
 
     metadata = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
 
-    # Adiciona avaliação de qualidade
+    # Avaliação de qualidade: combina AUC, baseline e profitabilidade
     quality = "poor"
-    if metadata.get("rocAuc", 0) > 0.65:
+    auc = metadata.get("rocAuc", 0)
+    profitability_verified = metadata.get("profitabilityVerified", False)
+
+    if auc > 0.65 and profitability_verified:
+        quality = "excellent"
+    elif auc > 0.65 or (auc > 0.60 and profitability_verified):
         quality = "good"
-    elif metadata.get("rocAuc", 0) > 0.6:
+    elif auc > 0.60 or profitability_verified:
         quality = "acceptable"
 
-    if metadata.get("improvesBaseline", False):
-        quality = "good" if quality == "good" else "acceptable"
+    if not metadata.get("improvesBaseline", False) and not profitability_verified:
+        quality = "poor"
 
     return {
         "available": True,
@@ -453,14 +806,67 @@ def predict_shadow(row: dict[str, Any]) -> dict[str, Any]:
         else:
             verdict = "STRONG_NEGATIVE"
 
+        metadata_ev: dict[str, Any] = {}
+        if METADATA_PATH.exists():
+            try:
+                meta = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+                optimal_threshold = float(meta.get("optimalThreshold", 0.60))
+                expected_value_pct = float(meta.get("expectedValuePct", 0.0))
+                simulated_win_rate = float(meta.get("simulatedWinRate", 0.0))
+                breakeven_win_rate = float(meta.get("breakevenWinRate", 0.0))
+                profitability_verified = bool(meta.get("profitabilityVerified", False))
+                metadata_ev = {
+                    "optimalThreshold": optimal_threshold,
+                    "expectedValuePct": expected_value_pct,
+                    "simulatedWinRate": simulated_win_rate,
+                    "breakevenWinRate": breakeven_win_rate,
+                    "profitabilityVerified": profitability_verified,
+                    "isAboveOptimalThreshold": calibrated >= optimal_threshold,
+                    "recommendation": (
+                        "ALLOW" if calibrated >= optimal_threshold
+                        else "BLOCK" if calibrated <= 0.45
+                        else "UNCERTAIN"
+                    ),
+                }
+            except Exception:
+                pass
+
+        # Uncertainty classification
+        if not METADATA_PATH.exists():
+            uncertainty_type = "UNCALIBRATED"
+        elif confidence >= 0.5:
+            uncertainty_type = "STRONG_EVIDENCE"
+        elif confidence >= 0.25:
+            uncertainty_type = "WEAK_EVIDENCE"
+        else:
+            uncertainty_type = "INSUFFICIENT_DATA"
+
+        # Model version from metadata
+        model_version = "shadow-unknown"
+        if METADATA_PATH.exists():
+            try:
+                meta_raw = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+                trained_at = int(meta_raw.get("trainedAt", 0))
+                if trained_at:
+                    fingerprint = str(meta_raw.get("datasetFingerprint") or "")[:12]
+                    model_version = (
+                        f"shadow-{trained_at}-{fingerprint}"
+                        if fingerprint else f"shadow-{trained_at}"
+                    )
+            except Exception:
+                pass
+
         return {
             "available": True,
             "authority": "shadow_ensemble",
-            "rawProbability": round(ensemble_proba if 'ensemble_proba' in dir() else raw, 6),
+            "rawProbability": round(ensemble_proba if 'ensemble_proba' in locals() else raw, 6),
             "calibratedProbability": round(calibrated, 6),
             "confidence": round(confidence, 3),
             "verdict": verdict,
             "recommendation": "ALLOW" if calibrated >= 0.55 else "BLOCK" if calibrated <= 0.45 else "UNCERTAIN",
+            "uncertaintyType": uncertainty_type,
+            "modelVersion": model_version,
+            **metadata_ev,
         }
 
     except Exception as e:

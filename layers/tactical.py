@@ -457,10 +457,6 @@ async def _process_snapshot(snap: MarketSnapshot):
         "rsi": snap.rsi_approx,
         "btc_regime": snap.btc_regime,
         "timestamp": snap.timestamp,
-        "source_timestamp": snap.source_timestamp,
-        "market_event_id": snap.market_event_id,
-        "freshness_seconds": snap.freshness_seconds,
-        "data_quality_incidents": snap.data_quality_incidents,
         "high_24h": snap.high_24h,
         "low_24h": snap.low_24h,
         "bid_depth_5": snap.bid_depth_5,
@@ -550,8 +546,6 @@ async def _process_snapshot(snap: MarketSnapshot):
             "ask_depth_5": snap.ask_depth_5,
             "book_imbalance": snap.bid_ask_imbalance,
             "cvd": snap.cumulative_delta,
-            "timestamp": snap.source_timestamp,
-            "market_event_id": snap.market_event_id,
         })
 
     if not snap.anomalies:

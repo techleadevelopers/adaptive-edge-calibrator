@@ -44,6 +44,15 @@ Quant Brain responde:
 - contrato rígido `edge-v3` com proveniência;
 - drift monitor com thresholds configuráveis;
 - governança champion/challenger com artefatos content-addressed e audit log;
+- auditor de execução com latência, slippage, spread, price move durante
+  latência, drag e separação entre `executionCausedLoss` e perda da estratégia;
+- experiment engine com assignment determinístico, métricas por braço,
+  intervalos de confiança, bootstrap, guardrails e recomendação;
+- score calibration por buckets, ECE, Brier, monotonicidade e score truth;
+- Market Regime Playbook Engine integrado ao Edge Gate, Coach Ranker e Exit
+  Intelligence;
+- position sizing e symbol rotation espelhados para consistência analítica;
+- Pipeline Integrity Audit bloqueia ingestão direta sem proveniência mínima;
 - retenção configurável por classe de dado;
 - endpoints de knowledge base, inteligência, notícias e diagnóstico.
 
@@ -92,6 +101,10 @@ O Quant Brain:
 - controla claim de evento para evitar duplicidade;
 - devolve os mesmos IDs, símbolo e lados;
 - informa timestamp, idade do dado, score, probabilidade, incerteza e decisão;
+- anexa assignments de experimento, `experimentId`, `experimentArm` e
+  `policyVersion` quando aplicável;
+- devolve `regimePlaybook`, regime, playbook, setups permitidos/bloqueados,
+  ajustes de score, TP/SL recomendados e sizing ajustado;
 - pode devolver `driftPolicy`.
 
 O backend valida a resposta com Zod e rejeita:
@@ -259,6 +272,80 @@ O status do modelo expõe:
 Alta AUC sem calibração ou EV líquido positivo não é critério suficiente para
 uso operacional.
 
+`GET /score-calibration/status` expõe buckets de 0.50 até 0.90+, win rate,
+PnL, PF, TP/SL, MFE/MAE, drag, expected vs actual, ECE, Brier,
+monotonicidade, overconfidence, underconfidence e recomendações por tamanho de
+amostra:
+
+```text
+<50 observe
+50-150 weak
+150-500 moderate
+500+ confident
+```
+
+Coach Ranker e Position Sizing podem usar o score calibrado para reduzir
+prioridade e risco quando o score bruto estiver superconfiante.
+
+## Regime Playbook
+
+`GET /regime-playbook/status` resume regimes, playbooks, setups permitidos,
+setups bloqueados, TP/SL, stacking, sizing e política de exit.
+
+O Edge Gate aplica o playbook no momento da avaliação e propaga `regime`,
+`playbook`, `setup_type`, `regime_confidence`, `playbook_version`,
+`stacking_depth` e recomendações de execução para o backend. A Knowledge Base
+agrega performance por playbook para fechar o ciclo de aprendizado.
+
+## Experimentos
+
+`GET /experiments/status` reporta experimentos ativos e métricas por braço:
+PnL, profit factor, win rate, drawdown, MFE/MAE, TP/SL/timeout, slippage,
+Sharpe, Sortino, intervalos de confiança e bootstrap.
+
+Assignments são determinísticos por hash para evitar troca oportunista de
+braço. Guardrails recomendam `continue`, `promote` ou `stop`.
+
+## Auditoria De Execução
+
+Trades registrados em `/kb/trades` e `/kb/trades/batch` passam pelo auditor
+quando carregam timestamps e preços de decisão/execução. O auditor calcula:
+
+- latência;
+- slippage;
+- spread;
+- price move durante latência;
+- drag total;
+- labels de qualidade;
+- `executionCausedLoss` separado do resultado da estratégia.
+
+Endpoints:
+
+```text
+GET  /execution/audit
+POST /execution/audit/trade
+```
+
+## Pipeline Integrity
+
+O auditor de pipeline valida proveniência antes da ingestão direta e do uso em
+treino. Outcomes devem carregar campos como `strategyVersion`, `configVersion`,
+`modelVersion`, `policyVersion`, `labelVersion` e `sourceType`.
+
+Ingestões quebradas em `/kb/trades` e `/kb/trades/batch` são bloqueadas ou
+marcadas como não elegíveis para aprendizado, preservando o dado operacional
+sem contaminar treino.
+
+## Sizing E Rotação
+
+`GET /position-sizing/status` e `POST /position-sizing/evaluate` avaliam tiers
+`MICRO`, `SCOUT`, `BASE`, `BOOST`, `AGGRESSIVE` e `MAX_SNIPER`, considerando
+score, execução, drawdown, profundidade e risco global.
+
+`core/symbol_rotation.py` espelha a política de rotation score, estados por
+símbolo, side bias, pesos de alocação e limites por símbolo para análise e
+consistência com o backend executor.
+
 ## Drift Monitor
 
 `GET /monitoring/drift` avalia:
@@ -339,6 +426,11 @@ Categorias persistidas incluem:
 - observações e alertas;
 - outcomes de trade;
 - signal outcomes;
+- exit outcomes;
+- campos de experimento;
+- campos de regime/playbook/setup;
+- campos de score/calibração;
+- campos de execução e sizing;
 - notícias;
 - qualidade de execução;
 - evidência de governança.
@@ -426,6 +518,11 @@ GET  /kb/trades/summary
 GET  /kb/trades/recent
 GET  /models/sniper/status
 GET  /signals/edge/{symbol}
+GET  /execution/audit
+GET  /experiments/status
+GET  /score-calibration/status
+GET  /regime-playbook/status
+GET  /position-sizing/status
 GET  /news/context/{symbol}
 GET  /health/live
 ```
@@ -472,6 +569,13 @@ POST /recommend/entry
 POST /edge/evaluate
 GET  /simulate/gate-rejections
 GET  /monitoring/drift
+GET  /execution/audit
+POST /execution/audit/trade
+GET  /experiments/status
+GET  /score-calibration/status
+GET  /regime-playbook/status
+GET  /position-sizing/status
+POST /position-sizing/evaluate
 
 POST /signals/finalize
 GET  /signals/edge/{symbol}

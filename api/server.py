@@ -13,9 +13,12 @@ import logging
 import uuid
 import json
 import gzip
+import base64
+from collections import deque
 from contextlib import asynccontextmanager
 from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, Any
 from functools import wraps
 
@@ -27,15 +30,27 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from core.feature_engine import FeatureEngine, SYMBOLS
 from core import knowledge_base as kb
-from core.database import close_pool, database_schema, using_postgres
+from core.database import close_pool, database_pool_status, database_schema, using_postgres
 from core.recommendation import recommend_entry, simulate_gate_rejections
 from core.edge_gate import evaluate_edge_gate
 from core.movement_sniper import evaluate_sniper_window, build_movement_features, classify_btc_commander
 from core.signal_learning import finalize_due_signal_outcomes, score_signal_context
 from core.shadow_model import restore_shadow_model, shadow_model_status, train_shadow_model
+from core.drift_monitor import evaluate_drift
 from core.shadow_sampler import shadow_sampler_status, sample_shadow_signals_once
 from core.job_supervisor import JobSupervisor
 from core.candle_regime import analyze_macro_candle_regime, candle_regime_status
+from core.market_data_quality import quality_status
+from core.model_governance import (
+    CampaignObservation,
+    CandidateSpec,
+    GovernanceStore,
+    GovernanceThresholds,
+    VersionSet,
+    evaluate_candidate,
+    monitor_and_demote,
+    promote_candidate,
+)
 from layers.tactical import process_tactical_cycle, get_active_alerts, get_snapshot_history
 from layers.strategic import build_strategic_report, report_to_dict, compute_edge_evolution
 from analyst.ai_analyst import (
@@ -57,6 +72,7 @@ _DB_INIT_RETRY_SECONDS = float(os.environ.get("DB_INIT_RETRY_SECONDS", "10"))
 _MODEL_MAINTENANCE_SECONDS = float(os.environ.get("MODEL_MAINTENANCE_SECONDS", "120"))
 _TACTICAL_LOOP_SECONDS = max(5, int(float(os.environ.get("TACTICAL_LOOP_SECONDS", "15"))))
 _JOB_MAX_CONCURRENCY = max(1, int(os.environ.get("JOB_MAX_CONCURRENCY", "2")))
+_JOB_MAX_QUEUE_SIZE = max(16, int(os.environ.get("JOB_MAX_QUEUE_SIZE", "256")))
 _JOB_STALE_AFTER_SECONDS = max(30, int(float(os.environ.get("JOB_STALE_AFTER_SECONDS", "120"))))
 _TACTICAL_JOB_TIMEOUT_SECONDS = max(5, int(float(os.environ.get("TACTICAL_JOB_TIMEOUT_SECONDS", "20"))))
 _SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS = max(5, int(float(os.environ.get("SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS", "25"))))
@@ -66,6 +82,13 @@ _MACRO_CANDLE_JOB_TIMEOUT_SECONDS = max(10, int(float(os.environ.get("MACRO_CAND
 job_supervisor = JobSupervisor(
     max_concurrent_jobs=_JOB_MAX_CONCURRENCY,
     stale_after_seconds=_JOB_STALE_AFTER_SECONDS,
+    max_queue_size=_JOB_MAX_QUEUE_SIZE,
+)
+governance_store = GovernanceStore(
+    Path(os.environ.get(
+        "MODEL_GOVERNANCE_DIR",
+        str(Path(__file__).parent.parent / "data" / "governance"),
+    ))
 )
 _RETENTION_MAINTENANCE_SECONDS = float(
     os.environ.get("RETENTION_MAINTENANCE_SECONDS", "3600")
@@ -83,7 +106,43 @@ _RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", 60))
 # Request tracking
 _request_counter = 0
 _error_counter = 0
-_endpoint_stats: defaultdict = defaultdict(lambda: {"calls": 0, "errors": 0, "total_time": 0})
+_endpoint_stats: defaultdict = defaultdict(
+    lambda: {"calls": 0, "errors": 0, "total_time": 0, "latencies_ms": deque(maxlen=2048)}
+)
+_event_loop_delay_ms: deque[float] = deque(maxlen=2048)
+_process_started_cpu = time.process_time()
+
+
+def _percentile(values, percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int((len(ordered) - 1) * percentile)))
+    return round(ordered[index], 2)
+
+
+def _process_metrics() -> dict:
+    uptime = max(0.001, time.time() - _runtime_state["started_at"])
+    result = {
+        "cpuTimeSeconds": round(time.process_time() - _process_started_cpu, 3),
+        "averageCpuPercent": round(
+            ((time.process_time() - _process_started_cpu) / uptime) * 100,
+            2,
+        ),
+    }
+    try:
+        import psutil
+        process = psutil.Process()
+        memory = process.memory_info()
+        result.update({
+            "rssBytes": memory.rss,
+            "vmsBytes": memory.vms,
+            "cpuPercent": process.cpu_percent(interval=None),
+            "threads": process.num_threads(),
+        })
+    except ImportError:
+        result["rssBytes"] = None
+    return result
 
 # Cache simples
 _response_cache: dict = {}
@@ -174,6 +233,7 @@ class MetricsMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             elapsed = time.time() - start
             _endpoint_stats[f"{method}:{path}"]["total_time"] += elapsed
+            _endpoint_stats[f"{method}:{path}"]["latencies_ms"].append(elapsed * 1000)
 
             if response.status_code >= 400:
                 _error_counter += 1
@@ -300,7 +360,8 @@ async def _initialize_runtime_services():
         lambda: process_tactical_cycle(engine),
         interval_seconds=_TACTICAL_LOOP_SECONDS,
         timeout_seconds=_TACTICAL_JOB_TIMEOUT_SECONDS,
-        priority="market",
+        priority="inference",
+        retry_budget=1,
     )
 
     from layers.strategic import run_strategic_loop
@@ -313,7 +374,8 @@ async def _initialize_runtime_services():
         _run_model_maintenance_once,
         interval_seconds=_MODEL_MAINTENANCE_SECONDS,
         timeout_seconds=_MODEL_JOB_TIMEOUT_SECONDS,
-        priority="low",
+        priority="training",
+        lock_key="model-training",
     )
     log.info(f"Signal finalizer/model maintenance registered ({_MODEL_MAINTENANCE_SECONDS:.1f}s interval)")
 
@@ -322,7 +384,7 @@ async def _initialize_runtime_services():
         lambda: analyze_macro_candle_regime(engine, SYMBOLS),
         interval_seconds=_MACRO_CANDLE_ANALYSIS_SECONDS,
         timeout_seconds=_MACRO_CANDLE_JOB_TIMEOUT_SECONDS,
-        priority="low",
+        priority="analytics",
         run_immediately=False,
     )
 
@@ -331,10 +393,10 @@ async def _initialize_runtime_services():
         "shadow_signal_sampler",
         lambda: sample_shadow_signals_once(engine),
         interval_seconds=sampler_interval,
-        timeout_seconds=_SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS,
-        priority="low",
+        timeout_seconds=max(30, int(float(os.environ.get("SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS", "60")))),
+        priority="inference",
         enabled=os.environ.get("SHADOW_SAMPLER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
-        run_immediately=False,
+        run_immediately=True,
     )
     job_supervisor.start()
     log.info(f"Runtime job supervisor started with {len(job_supervisor.jobs)} jobs")
@@ -372,6 +434,17 @@ async def lifespan(app: FastAPI):
 
     t3 = asyncio.create_task(cache_cleaner())
     _tasks.append(t3)
+
+    async def event_loop_monitor():
+        interval = 0.1
+        expected = time.monotonic() + interval
+        while True:
+            await asyncio.sleep(interval)
+            now = time.monotonic()
+            _event_loop_delay_ms.append(max(0.0, (now - expected) * 1000))
+            expected = now + interval
+
+    _tasks.append(asyncio.create_task(event_loop_monitor(), name="event-loop-monitor"))
 
     elapsed = time.time() - start_time
     log.info(f"✅ Quant Brain HTTP online em {elapsed:.2f}s; runtime initializing")
@@ -459,6 +532,15 @@ async def get_metrics():
             "ttl_seconds": _CACHE_TTL_SECONDS,
         },
         "jobs": job_supervisor.status(),
+        "market_data_quality": quality_status(),
+        "databasePool": database_pool_status(),
+        "process": _process_metrics(),
+        "eventLoopDelayMs": {
+            "p50": _percentile(_event_loop_delay_ms, 0.50),
+            "p95": _percentile(_event_loop_delay_ms, 0.95),
+            "p99": _percentile(_event_loop_delay_ms, 0.99),
+            "max": round(max(_event_loop_delay_ms), 2) if _event_loop_delay_ms else 0.0,
+        },
     }
 
     for endpoint, stats in _endpoint_stats.items():
@@ -466,6 +548,9 @@ async def get_metrics():
             "calls": stats["calls"],
             "errors": stats["errors"],
             "avg_time_ms": round(stats["total_time"] / max(1, stats["calls"]) * 1000, 2),
+            "p50_time_ms": _percentile(stats["latencies_ms"], 0.50),
+            "p95_time_ms": _percentile(stats["latencies_ms"], 0.95),
+            "p99_time_ms": _percentile(stats["latencies_ms"], 0.99),
         }
 
     return metrics
@@ -792,6 +877,9 @@ async def record_trade(body: dict):
     side = body.get("positionSide") or body.get("position_side") or body.get("side")
     if not side:
         raise HTTPException(400, "Required field: side or positionSide")
+    side = str(side).upper()
+    if side not in {"LONG", "SHORT"}:
+        raise HTTPException(422, "Outcome side must be LONG or SHORT")
     pnl_pct = body.get("pnl_pct")
     if pnl_pct is None:
         realized_pnl = float(body.get("realizedPnl", body.get("realized_pnl", 0)))
@@ -800,25 +888,45 @@ async def record_trade(body: dict):
 
     pnl_usdt = body.get("pnl_usdt", body.get("realizedPnl", 0))
 
-    recorded = await kb.record_trade_outcome(
-        source_id=str(body.get("id") or "") or None,
-        source=str(body.get("source") or "manual"),
-        is_demo=bool(body.get("isDemo", body.get("is_demo", False))),
-        symbol=body["symbol"],
-        side=side,
-        pnl_pct=float(pnl_pct),
-        pnl_usdt=float(pnl_usdt) if pnl_usdt else 0.0,
-        entry_price=float(body.get("entry_price", body.get("entryPrice", 0))),
-        exit_price=float(body.get("exit_price", body.get("exitPrice", 0))),
-        oi_change=float(body.get("oi_change", body.get("oiChange", 0))),
-        funding=float(body.get("funding", body.get("fundingRate", 0))),
-        volume_ratio=float(body.get("volume_ratio", body.get("volumeRatio", 1))),
-        btc_regime=body.get("btc_regime", body.get("btcRegime", "NEUTRAL")),
-        rsi=float(body.get("rsi", body.get("rsiAtEntry", 50))),
-        ema_cross=body.get("ema_cross", body.get("emaCross", "FLAT")),
-        slippage_bps=float(body.get("slippage_bps", body.get("slippageBps", 0))),
-        fee_paid_usdt=float(body.get("fee_paid_usdt", body.get("feePaidUsdt", 0))),
-    )
+    source_id = str(body.get("id") or "")
+    if not source_id:
+        raise HTTPException(400, "Required field: id")
+
+    async def write_outcome():
+        return await kb.record_trade_outcome(
+            source_id=source_id,
+            source=str(body.get("source") or "manual"),
+            is_demo=bool(body.get("isDemo", body.get("is_demo", False))),
+            symbol=body["symbol"],
+            side=side,
+            pnl_pct=float(pnl_pct),
+            pnl_usdt=float(pnl_usdt) if pnl_usdt else 0.0,
+            entry_price=float(body.get("entry_price", body.get("entryPrice", 0))),
+            exit_price=float(body.get("exit_price", body.get("exitPrice", 0))),
+            oi_change=float(body.get("oi_change", body.get("oiChange", 0))),
+            funding=float(body.get("funding", body.get("fundingRate", 0))),
+            volume_ratio=float(body.get("volume_ratio", body.get("volumeRatio", 1))),
+            btc_regime=body.get("btc_regime", body.get("btcRegime", "NEUTRAL")),
+            rsi=float(body.get("rsi", body.get("rsiAtEntry", 50))),
+            ema_cross=body.get("ema_cross", body.get("emaCross", "FLAT")),
+            slippage_bps=float(body.get("slippage_bps", body.get("slippageBps", 0))),
+            fee_paid_usdt=float(body.get("fee_paid_usdt", body.get("feePaidUsdt", 0))),
+            signal_id=str(body.get("signalId") or "") or None,
+            label_version=str(body.get("labelVersion") or "campaign-pnl-v1"),
+        )
+
+    try:
+        recorded = await job_supervisor.execute(
+            f"reconcile_trade:{source_id or body['symbol']}",
+            write_outcome,
+            priority="reconciliation",
+            timeout_seconds=10,
+            queue_timeout_seconds=5,
+            lock_key=f"trade:{source_id}" if source_id else None,
+            retry_budget=1,
+        )
+    except (asyncio.TimeoutError, RuntimeError) as exc:
+        raise HTTPException(503, f"Reconciliation backpressure: {exc}") from exc
 
     # Invalida cache relacionado
     _response_cache.clear()
@@ -826,6 +934,8 @@ async def record_trade(body: dict):
     return {
         "ok": True,
         "recorded": recorded,
+        "duplicate": not recorded,
+        "sourceId": source_id,
         "symbol": body["symbol"],
         "pnl_pct": float(pnl_pct),
     }
@@ -873,27 +983,186 @@ async def evaluate_edge_endpoint(body: dict):
     if "symbol" not in body:
         raise HTTPException(400, "Required field: symbol")
     try:
-        return await asyncio.wait_for(evaluate_edge_gate(body), timeout=25)
+        return await job_supervisor.execute(
+            f"inference:{body['symbol']}",
+            lambda: evaluate_edge_gate(body),
+            priority="inference",
+            timeout_seconds=25,
+            queue_timeout_seconds=2,
+        )
     except asyncio.TimeoutError:
         log.exception("edge evaluate timeout")
-        return {
-            "allow": True,
-            "gateRejects": [],
-            "score": 0.0,
-            "authority": "quant-brain-degraded",
-            "mode": "degraded_timeout",
-            "error": "edge_evaluate_timeout",
-        }
+        raise HTTPException(504, "edge_evaluate_timeout")
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
     except Exception as exc:
         log.exception("edge evaluate failed")
+        raise HTTPException(503, f"edge_evaluate_failed: {type(exc).__name__}")
+
+
+# ========== MODEL GOVERNANCE ==========
+
+def _governance_thresholds(value: dict | None) -> GovernanceThresholds:
+    raw = value or {}
+    allowed = GovernanceThresholds.__dataclass_fields__.keys()
+    return GovernanceThresholds(**{
+        key: raw[key] for key in allowed if key in raw
+    })
+
+
+def _campaign_observation(value: dict) -> CampaignObservation:
+    aliases = {
+        "candidate_id": "candidateId",
+        "campaign_id": "campaignId",
+        "observed_at": "observedAt",
+        "label_end_at": "labelEndAt",
+        "net_vst": "netVst",
+        "candidate_accepted": "candidateAccepted",
+        "baseline_accepted": "baselineAccepted",
+        "champion_accepted": "championAccepted",
+        "operational_ok": "operationalOk",
+        "predicted_probability": "predictedProbability",
+    }
+    normalized = {
+        field: value.get(field, value.get(alias))
+        for field, alias in aliases.items()
+    }
+    normalized.update({
+        "symbol": value.get("symbol"),
+        "side": value.get("side"),
+        "regime": value.get("regime"),
+        "outcome": value.get("outcome"),
+    })
+    if normalized["operational_ok"] is None:
+        normalized["operational_ok"] = True
+    return CampaignObservation(**normalized)
+
+
+@app.get("/governance/status")
+async def governance_status_endpoint():
+    return governance_store.status()
+
+
+@app.post("/governance/candidates")
+async def register_governance_candidate_endpoint(body: dict):
+    try:
+        artifact = base64.b64decode(
+            str(body["artifactBase64"]),
+            validate=True,
+        )
+        versions = VersionSet(
+            feature=str(body["featureVersion"]),
+            label=str(body["labelVersion"]),
+            policy=str(body["policyVersion"]),
+        )
+        artifact_sha256 = governance_store.put_artifact(
+            artifact,
+            {
+                "candidateId": body["candidateId"],
+                "kind": body["kind"],
+                "versions": {
+                    "feature": versions.feature,
+                    "label": versions.label,
+                    "policy": versions.policy,
+                },
+                "format": body.get("artifactFormat", "opaque"),
+            },
+        )
+        candidate = governance_store.register(CandidateSpec(
+            candidate_id=str(body["candidateId"]),
+            kind=str(body["kind"]),
+            versions=versions,
+            artifact_sha256=artifact_sha256,
+            created_at=time.time(),
+            parent_candidate_id=body.get("parentCandidateId"),
+            metadata=dict(body.get("metadata") or {}),
+        ))
         return {
-            "allow": True,
-            "gateRejects": [],
-            "score": 0.0,
-            "authority": "quant-brain-degraded",
-            "mode": "degraded_error",
-            "error": f"{type(exc).__name__}: {exc}",
+            "candidate": candidate.__dict__,
+            "artifactSha256": artifact_sha256,
         }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/governance/observations")
+async def record_governance_observations_endpoint(body: dict):
+    try:
+        observations = [
+            _campaign_observation(item)
+            for item in body.get("observations", [])
+        ]
+        if not observations:
+            raise ValueError("at least one campaign observation is required")
+        appended = governance_store.append_observations(observations)
+        monitors = {}
+        thresholds = _governance_thresholds(body.get("thresholds"))
+        for candidate_id in sorted({row.candidate_id for row in observations}):
+            candidate = governance_store.get(candidate_id)
+            if candidate.state not in {"review", "champion"}:
+                continue
+            monitors[candidate_id] = monitor_and_demote(
+                governance_store,
+                candidate_id,
+                governance_store.observations(candidate_id, limit=500),
+                thresholds,
+            )
+        return {"appended": appended, "monitors": monitors}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"unknown candidate: {exc}") from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/governance/evaluate/{candidate_id}")
+async def evaluate_governance_candidate_endpoint(candidate_id: str, body: dict):
+    try:
+        candidate = governance_store.get(candidate_id)
+        observations = governance_store.observations(candidate_id)
+        evidence = evaluate_candidate(
+            candidate,
+            observations,
+            _governance_thresholds(body.get("thresholds")),
+        )
+        governance_store.put_evidence(evidence)
+        if candidate.state == "shadow":
+            governance_store.transition(
+                candidate_id,
+                "review",
+                "walk-forward evidence recorded; awaiting promotion decision",
+                evidence_digest=evidence["evidence_digest"],
+            )
+        return evidence
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"unknown candidate: {exc}") from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/governance/promote/{candidate_id}")
+async def promote_governance_candidate_endpoint(candidate_id: str, body: dict):
+    try:
+        evidence = governance_store.get_evidence(str(body["evidenceDigest"]))
+        candidate = promote_candidate(governance_store, candidate_id, evidence)
+        return {"candidate": candidate.__dict__}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/governance/rollback/{candidate_id}")
+async def rollback_governance_candidate_endpoint(candidate_id: str, body: dict):
+    try:
+        restored = governance_store.rollback(
+            candidate_id,
+            str(body.get("reason") or "operator-requested rollback"),
+        )
+        return {"restoredChampion": restored.__dict__}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 # ========== SIGNALS ==========
@@ -901,13 +1170,31 @@ async def evaluate_edge_endpoint(body: dict):
 @app.post("/signals/finalize")
 async def finalize_signals_endpoint():
     """Finalize pending signal outcomes after the 300s sniper validation window."""
-    return await finalize_due_signal_outcomes()
+    return await job_supervisor.execute(
+        "finalize_signals",
+        finalize_due_signal_outcomes,
+        priority="reconciliation",
+        timeout_seconds=30,
+        queue_timeout_seconds=5,
+        lock_key="finalize-signals",
+        retry_budget=1,
+    )
 
 
 @app.post("/models/sniper/train")
 async def train_sniper_model_endpoint(min_samples: int = Query(300, ge=100, le=100000)):
     """Train and validate the calibrated sniper model; authority remains shadow-only."""
-    return await train_shadow_model(min_samples=min_samples)
+    try:
+        return await job_supervisor.execute(
+            "manual_model_training",
+            lambda: train_shadow_model(min_samples=min_samples),
+            priority="training",
+            timeout_seconds=max(60, _MODEL_JOB_TIMEOUT_SECONDS),
+            queue_timeout_seconds=2,
+            lock_key="model-training",
+        )
+    except RuntimeError as exc:
+        raise HTTPException(429, f"Training backpressure: {exc}") from exc
 
 
 @app.get("/models/sniper/status")
@@ -917,10 +1204,20 @@ async def sniper_model_status_endpoint():
     await restore_shadow_model()
     status = shadow_model_status()
     progress = await kb.get_signal_training_summary(decision_group=None, source_type=None)
+    readiness = await kb.get_signal_readiness_diagnostics(min_samples=300, source_type=None)
     pipeline = await kb.get_signal_pipeline_summary()
     sources = await kb.get_signal_source_summary()
     recent_shadow = await kb.get_recent_signal_outcomes(limit=10, source_type="shadow_sampler")
     samples = int(progress["samples"])
+    sampler_st = shadow_sampler_status()
+    cycles = int(sampler_st.get("cycles", 0) or 0)
+    recorded = int(sampler_st.get("recorded", 0) or 0)
+    interval = int(sampler_st.get("intervalSeconds", 60) or 60)
+    samples_per_hour = round((recorded / cycles) * (3600 / interval)) if cycles > 0 else 0
+    pending = int(pipeline.get("pending", 0) or 0)
+    samples_needed = max(0, 300 - samples - pending)
+    eta_hours = round(samples_needed / samples_per_hour, 2) if samples_per_hour > 0 else None
+
     return {
         **status,
         "samples": int(status.get("samples", samples) or samples),
@@ -931,12 +1228,86 @@ async def sniper_model_status_endpoint():
         "misses": progress["misses"],
         "hasBothClasses": progress["hasBothClasses"],
         "trainingMode": "automatic_shadow",
+        "readiness": readiness,
+        "datasetFingerprint": readiness["datasetFingerprint"],
         "signalPipeline": pipeline,
         "signalSources": sources,
-        "shadowSampler": shadow_sampler_status(),
+        "shadowSampler": sampler_st,
         "macroCandleRegime": candle_regime_status(),
         "recentShadowSignals": recent_shadow,
+        "learningVelocity": {
+            "samplesPerHour": samples_per_hour,
+            "etaHours": eta_hours,
+            "recordedTotal": recorded,
+            "cycles": cycles,
+        },
     }
+
+
+@app.post("/kb/trades/batch")
+async def record_trade_batch(body: list[dict]):
+    """Persist outcome batches without N HTTP requests or N DB acquisitions."""
+    if not isinstance(body, list) or not body or len(body) > 100:
+        raise HTTPException(400, "Body must contain 1..100 trade outcomes")
+
+    normalized = []
+    for item in body:
+        if "symbol" not in item:
+            raise HTTPException(400, "Required field: symbol")
+        side = item.get("positionSide") or item.get("position_side") or item.get("side")
+        if not side:
+            raise HTTPException(400, "Required field: side or positionSide")
+        realized_pnl = float(item.get("realizedPnl", item.get("realized_pnl", 0)))
+        margin_used = float(item.get("marginUsed", item.get("margin_used", 0)))
+        pnl_pct = item.get("pnl_pct")
+        if pnl_pct is None:
+            pnl_pct = (realized_pnl / margin_used * 100) if margin_used > 0 else realized_pnl
+        normalized.append({
+            "source_id": str(item.get("id") or "") or None,
+            "source": str(item.get("source") or "manual"),
+            "is_demo": bool(item.get("isDemo", item.get("is_demo", False))),
+            "symbol": item["symbol"],
+            "side": side,
+            "pnl_pct": float(pnl_pct),
+            "pnl_usdt": float(item.get("pnl_usdt", realized_pnl) or 0),
+            "entry_price": float(item.get("entry_price", item.get("entryPrice", 0))),
+            "exit_price": float(item.get("exit_price", item.get("exitPrice", 0))),
+            "oi_change": float(item.get("oi_change", item.get("oiChange", 0))),
+            "funding": float(item.get("funding", item.get("fundingRate", 0))),
+            "volume_ratio": float(item.get("volume_ratio", item.get("volumeRatio", 1))),
+            "btc_regime": item.get("btc_regime", item.get("btcRegime", "NEUTRAL")),
+            "rsi": float(item.get("rsi", item.get("rsiAtEntry", 50))),
+            "ema_cross": item.get("ema_cross", item.get("emaCross", "FLAT")),
+            "slippage_bps": float(item.get("slippage_bps", item.get("slippageBps", 0))),
+            "fee_paid_usdt": float(item.get("fee_paid_usdt", item.get("feePaidUsdt", 0))),
+            "signal_id": str(item.get("signalId") or "") or None,
+            "label_version": str(item.get("labelVersion") or "campaign-pnl-v1"),
+        })
+
+    try:
+        results = await job_supervisor.execute(
+            f"reconcile_batch:{len(normalized)}",
+            lambda: kb.record_trade_outcomes_batch(normalized),
+            priority="reconciliation",
+            timeout_seconds=20,
+            queue_timeout_seconds=5,
+            retry_budget=1,
+        )
+    except (asyncio.TimeoutError, RuntimeError) as exc:
+        raise HTTPException(503, f"Reconciliation backpressure: {exc}") from exc
+
+    _response_cache.clear()
+    return {
+        "ok": True,
+        "received": len(normalized),
+        "recorded": sum(1 for result in results if result),
+        "duplicates": sum(1 for result in results if not result),
+    }
+
+
+@app.get("/monitoring/drift")
+async def drift_monitoring_endpoint():
+    return await evaluate_drift()
 
 
 @app.get("/signals/shadow-sampler/status")
@@ -951,7 +1322,14 @@ async def shadow_sampler_status_endpoint():
 
 @app.post("/signals/shadow-sampler/run")
 async def run_shadow_sampler_once_endpoint():
-    result = await sample_shadow_signals_once(engine)
+    result = await job_supervisor.execute(
+        "manual_shadow_sampler",
+        lambda: sample_shadow_signals_once(engine),
+        priority="inference",
+        timeout_seconds=_SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS,
+        queue_timeout_seconds=2,
+        lock_key="manual-shadow-sampler",
+    )
     return {
         "ok": True,
         "sampler": shadow_sampler_status(),

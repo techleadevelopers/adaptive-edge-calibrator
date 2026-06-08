@@ -465,3 +465,43 @@ GET  /kb/feature-history/{symbol}
 POST /recommend/entry
 GET  /simulate/gate-rejections
 ```
+
+## Champion/Challenger Governance
+
+Model authority is managed separately from training. The supported portfolio is:
+
+- `deterministic_baseline`;
+- `current_champion`;
+- `ml_challenger`;
+- `stacking_policy_challenger`;
+- `early_exit_shadow_challenger`.
+
+Artifacts are stored by SHA-256 under `data/governance/artifacts`. Candidate
+registrations bind an artifact to explicit feature, label, and policy versions.
+Registrations and evidence are immutable; state changes are appended to
+`data/governance/audit.jsonl`.
+
+Evaluation uses chronological campaign-level walk-forward folds. Training rows
+whose labels overlap a validation boundary are purged. Confidence intervals are
+bootstrapped by independent campaign, not by correlated trade row. Promotion
+requires positive out-of-sample net VST expectancy, baseline improvement,
+controlled drawdown, calibration and reliability checks, and coverage across
+multiple symbols, sides, and regimes.
+
+The newest campaign partition is reserved as a fingerprinted final test set.
+Its metrics are not exposed by the selection endpoint, so thresholds and policy
+choices cannot be optimized against it.
+
+New campaign observations automatically monitor candidates in `review` or
+`champion`. Deteriorating expectancy, calibration, drawdown, or operational
+reliability returns the candidate to `shadow`. Promotion and rollback remain
+explicit, audited transitions.
+
+```text
+GET  /governance/status
+POST /governance/candidates
+POST /governance/observations
+POST /governance/evaluate/{candidate_id}
+POST /governance/promote/{candidate_id}
+POST /governance/rollback/{candidate_id}
+```

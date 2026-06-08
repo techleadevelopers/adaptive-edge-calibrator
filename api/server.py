@@ -13,12 +13,9 @@ import logging
 import uuid
 import json
 import gzip
-import base64
-from collections import deque
 from contextlib import asynccontextmanager
 from collections import defaultdict
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional, Any
 from functools import wraps
 
@@ -30,27 +27,23 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from core.feature_engine import FeatureEngine, SYMBOLS
 from core import knowledge_base as kb
-from core.database import close_pool, database_pool_status, database_schema, using_postgres
+from core.database import close_pool, database_schema, using_postgres
 from core.recommendation import recommend_entry, simulate_gate_rejections
 from core.edge_gate import evaluate_edge_gate
 from core.movement_sniper import evaluate_sniper_window, build_movement_features, classify_btc_commander
 from core.signal_learning import finalize_due_signal_outcomes, score_signal_context
 from core.shadow_model import restore_shadow_model, shadow_model_status, train_shadow_model
-from core.drift_monitor import evaluate_drift
 from core.shadow_sampler import shadow_sampler_status, sample_shadow_signals_once
+from core.exit_intelligence import evaluate_exit
+from core.exit_learning import record_exit_outcome as _record_exit_outcome, record_exit_evaluation, get_exit_stats
+from core.experiment_engine import experiment_status, infer_assignment_for_outcome
+from core.execution_auditor import record_trade_audit, get_execution_audit_report
+from core.pipeline_auditor import validate_learning_eligibility
+from core.position_sizing import calculate_position_size, build_status as build_position_sizing_status
 from core.job_supervisor import JobSupervisor
+from core.score_calibration import run_score_calibration
 from core.candle_regime import analyze_macro_candle_regime, candle_regime_status
-from core.market_data_quality import quality_status
-from core.model_governance import (
-    CampaignObservation,
-    CandidateSpec,
-    GovernanceStore,
-    GovernanceThresholds,
-    VersionSet,
-    evaluate_candidate,
-    monitor_and_demote,
-    promote_candidate,
-)
+from core.regime_playbook import classify_regime_playbook
 from layers.tactical import process_tactical_cycle, get_active_alerts, get_snapshot_history
 from layers.strategic import build_strategic_report, report_to_dict, compute_edge_evolution
 from analyst.ai_analyst import (
@@ -72,7 +65,6 @@ _DB_INIT_RETRY_SECONDS = float(os.environ.get("DB_INIT_RETRY_SECONDS", "10"))
 _MODEL_MAINTENANCE_SECONDS = float(os.environ.get("MODEL_MAINTENANCE_SECONDS", "120"))
 _TACTICAL_LOOP_SECONDS = max(5, int(float(os.environ.get("TACTICAL_LOOP_SECONDS", "15"))))
 _JOB_MAX_CONCURRENCY = max(1, int(os.environ.get("JOB_MAX_CONCURRENCY", "2")))
-_JOB_MAX_QUEUE_SIZE = max(16, int(os.environ.get("JOB_MAX_QUEUE_SIZE", "256")))
 _JOB_STALE_AFTER_SECONDS = max(30, int(float(os.environ.get("JOB_STALE_AFTER_SECONDS", "120"))))
 _TACTICAL_JOB_TIMEOUT_SECONDS = max(5, int(float(os.environ.get("TACTICAL_JOB_TIMEOUT_SECONDS", "20"))))
 _SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS = max(5, int(float(os.environ.get("SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS", "25"))))
@@ -82,13 +74,6 @@ _MACRO_CANDLE_JOB_TIMEOUT_SECONDS = max(10, int(float(os.environ.get("MACRO_CAND
 job_supervisor = JobSupervisor(
     max_concurrent_jobs=_JOB_MAX_CONCURRENCY,
     stale_after_seconds=_JOB_STALE_AFTER_SECONDS,
-    max_queue_size=_JOB_MAX_QUEUE_SIZE,
-)
-governance_store = GovernanceStore(
-    Path(os.environ.get(
-        "MODEL_GOVERNANCE_DIR",
-        str(Path(__file__).parent.parent / "data" / "governance"),
-    ))
 )
 _RETENTION_MAINTENANCE_SECONDS = float(
     os.environ.get("RETENTION_MAINTENANCE_SECONDS", "3600")
@@ -106,43 +91,7 @@ _RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", 60))
 # Request tracking
 _request_counter = 0
 _error_counter = 0
-_endpoint_stats: defaultdict = defaultdict(
-    lambda: {"calls": 0, "errors": 0, "total_time": 0, "latencies_ms": deque(maxlen=2048)}
-)
-_event_loop_delay_ms: deque[float] = deque(maxlen=2048)
-_process_started_cpu = time.process_time()
-
-
-def _percentile(values, percentile: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    index = min(len(ordered) - 1, max(0, int((len(ordered) - 1) * percentile)))
-    return round(ordered[index], 2)
-
-
-def _process_metrics() -> dict:
-    uptime = max(0.001, time.time() - _runtime_state["started_at"])
-    result = {
-        "cpuTimeSeconds": round(time.process_time() - _process_started_cpu, 3),
-        "averageCpuPercent": round(
-            ((time.process_time() - _process_started_cpu) / uptime) * 100,
-            2,
-        ),
-    }
-    try:
-        import psutil
-        process = psutil.Process()
-        memory = process.memory_info()
-        result.update({
-            "rssBytes": memory.rss,
-            "vmsBytes": memory.vms,
-            "cpuPercent": process.cpu_percent(interval=None),
-            "threads": process.num_threads(),
-        })
-    except ImportError:
-        result["rssBytes"] = None
-    return result
+_endpoint_stats: defaultdict = defaultdict(lambda: {"calls": 0, "errors": 0, "total_time": 0})
 
 # Cache simples
 _response_cache: dict = {}
@@ -233,7 +182,6 @@ class MetricsMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             elapsed = time.time() - start
             _endpoint_stats[f"{method}:{path}"]["total_time"] += elapsed
-            _endpoint_stats[f"{method}:{path}"]["latencies_ms"].append(elapsed * 1000)
 
             if response.status_code >= 400:
                 _error_counter += 1
@@ -360,8 +308,7 @@ async def _initialize_runtime_services():
         lambda: process_tactical_cycle(engine),
         interval_seconds=_TACTICAL_LOOP_SECONDS,
         timeout_seconds=_TACTICAL_JOB_TIMEOUT_SECONDS,
-        priority="inference",
-        retry_budget=1,
+        priority="market",
     )
 
     from layers.strategic import run_strategic_loop
@@ -374,8 +321,7 @@ async def _initialize_runtime_services():
         _run_model_maintenance_once,
         interval_seconds=_MODEL_MAINTENANCE_SECONDS,
         timeout_seconds=_MODEL_JOB_TIMEOUT_SECONDS,
-        priority="training",
-        lock_key="model-training",
+        priority="low",
     )
     log.info(f"Signal finalizer/model maintenance registered ({_MODEL_MAINTENANCE_SECONDS:.1f}s interval)")
 
@@ -384,7 +330,7 @@ async def _initialize_runtime_services():
         lambda: analyze_macro_candle_regime(engine, SYMBOLS),
         interval_seconds=_MACRO_CANDLE_ANALYSIS_SECONDS,
         timeout_seconds=_MACRO_CANDLE_JOB_TIMEOUT_SECONDS,
-        priority="analytics",
+        priority="low",
         run_immediately=False,
     )
 
@@ -394,7 +340,7 @@ async def _initialize_runtime_services():
         lambda: sample_shadow_signals_once(engine),
         interval_seconds=sampler_interval,
         timeout_seconds=max(30, int(float(os.environ.get("SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS", "60")))),
-        priority="inference",
+        priority="normal",
         enabled=os.environ.get("SHADOW_SAMPLER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
         run_immediately=True,
     )
@@ -434,17 +380,6 @@ async def lifespan(app: FastAPI):
 
     t3 = asyncio.create_task(cache_cleaner())
     _tasks.append(t3)
-
-    async def event_loop_monitor():
-        interval = 0.1
-        expected = time.monotonic() + interval
-        while True:
-            await asyncio.sleep(interval)
-            now = time.monotonic()
-            _event_loop_delay_ms.append(max(0.0, (now - expected) * 1000))
-            expected = now + interval
-
-    _tasks.append(asyncio.create_task(event_loop_monitor(), name="event-loop-monitor"))
 
     elapsed = time.time() - start_time
     log.info(f"✅ Quant Brain HTTP online em {elapsed:.2f}s; runtime initializing")
@@ -532,15 +467,6 @@ async def get_metrics():
             "ttl_seconds": _CACHE_TTL_SECONDS,
         },
         "jobs": job_supervisor.status(),
-        "market_data_quality": quality_status(),
-        "databasePool": database_pool_status(),
-        "process": _process_metrics(),
-        "eventLoopDelayMs": {
-            "p50": _percentile(_event_loop_delay_ms, 0.50),
-            "p95": _percentile(_event_loop_delay_ms, 0.95),
-            "p99": _percentile(_event_loop_delay_ms, 0.99),
-            "max": round(max(_event_loop_delay_ms), 2) if _event_loop_delay_ms else 0.0,
-        },
     }
 
     for endpoint, stats in _endpoint_stats.items():
@@ -548,12 +474,15 @@ async def get_metrics():
             "calls": stats["calls"],
             "errors": stats["errors"],
             "avg_time_ms": round(stats["total_time"] / max(1, stats["calls"]) * 1000, 2),
-            "p50_time_ms": _percentile(stats["latencies_ms"], 0.50),
-            "p95_time_ms": _percentile(stats["latencies_ms"], 0.95),
-            "p99_time_ms": _percentile(stats["latencies_ms"], 0.99),
         }
 
     return metrics
+
+
+@app.get("/experiments/status")
+async def get_experiments_status(days: int = Query(30, ge=1, le=365)):
+    """A/B experiment status: active arms, samples, PnL, PF, drawdown and recommendation."""
+    return await experiment_status(days=days)
 
 
 @app.get("/health/live")
@@ -874,12 +803,18 @@ async def record_trade(body: dict):
     for r in required:
         if r not in body:
             raise HTTPException(400, f"Campo obrigatório: {r}")
+    eligibility = validate_learning_eligibility(body)
+    if not eligibility.learning_eligible:
+        raise HTTPException(
+            422,
+            {
+                "error": "pipeline_integrity_blocked",
+                "blockedReasons": eligibility.blocked_reasons,
+            },
+        )
     side = body.get("positionSide") or body.get("position_side") or body.get("side")
     if not side:
         raise HTTPException(400, "Required field: side or positionSide")
-    side = str(side).upper()
-    if side not in {"LONG", "SHORT"}:
-        raise HTTPException(422, "Outcome side must be LONG or SHORT")
     pnl_pct = body.get("pnl_pct")
     if pnl_pct is None:
         realized_pnl = float(body.get("realizedPnl", body.get("realized_pnl", 0)))
@@ -887,46 +822,96 @@ async def record_trade(body: dict):
         pnl_pct = (realized_pnl / margin_used * 100) if margin_used > 0 else realized_pnl
 
     pnl_usdt = body.get("pnl_usdt", body.get("realizedPnl", 0))
+    experiment = await infer_assignment_for_outcome(body) or {}
 
-    source_id = str(body.get("id") or "")
-    if not source_id:
-        raise HTTPException(400, "Required field: id")
-
-    async def write_outcome():
-        return await kb.record_trade_outcome(
-            source_id=source_id,
-            source=str(body.get("source") or "manual"),
-            is_demo=bool(body.get("isDemo", body.get("is_demo", False))),
-            symbol=body["symbol"],
-            side=side,
-            pnl_pct=float(pnl_pct),
-            pnl_usdt=float(pnl_usdt) if pnl_usdt else 0.0,
-            entry_price=float(body.get("entry_price", body.get("entryPrice", 0))),
-            exit_price=float(body.get("exit_price", body.get("exitPrice", 0))),
-            oi_change=float(body.get("oi_change", body.get("oiChange", 0))),
-            funding=float(body.get("funding", body.get("fundingRate", 0))),
-            volume_ratio=float(body.get("volume_ratio", body.get("volumeRatio", 1))),
-            btc_regime=body.get("btc_regime", body.get("btcRegime", "NEUTRAL")),
-            rsi=float(body.get("rsi", body.get("rsiAtEntry", 50))),
-            ema_cross=body.get("ema_cross", body.get("emaCross", "FLAT")),
-            slippage_bps=float(body.get("slippage_bps", body.get("slippageBps", 0))),
-            fee_paid_usdt=float(body.get("fee_paid_usdt", body.get("feePaidUsdt", 0))),
-            signal_id=str(body.get("signalId") or "") or None,
-            label_version=str(body.get("labelVersion") or "campaign-pnl-v1"),
-        )
-
-    try:
-        recorded = await job_supervisor.execute(
-            f"reconcile_trade:{source_id or body['symbol']}",
-            write_outcome,
-            priority="reconciliation",
-            timeout_seconds=10,
-            queue_timeout_seconds=5,
-            lock_key=f"trade:{source_id}" if source_id else None,
-            retry_budget=1,
-        )
-    except (asyncio.TimeoutError, RuntimeError) as exc:
-        raise HTTPException(503, f"Reconciliation backpressure: {exc}") from exc
+    recorded = await kb.record_trade_outcome(
+        source_id=str(body.get("id") or "") or None,
+        source=str(body.get("source") or "manual"),
+        is_demo=bool(body.get("isDemo", body.get("is_demo", False))),
+        symbol=body["symbol"],
+        side=side,
+        pnl_pct=float(pnl_pct),
+        pnl_usdt=float(pnl_usdt) if pnl_usdt else 0.0,
+        entry_price=float(body.get("entry_price", body.get("entryPrice", 0))),
+        exit_price=float(body.get("exit_price", body.get("exitPrice", 0))),
+        oi_change=float(body.get("oi_change", body.get("oiChange", 0))),
+        funding=float(body.get("funding", body.get("fundingRate", 0))),
+        volume_ratio=float(body.get("volume_ratio", body.get("volumeRatio", 1))),
+        btc_regime=body.get("btc_regime", body.get("btcRegime", "NEUTRAL")),
+        rsi=float(body.get("rsi", body.get("rsiAtEntry", 50))),
+        ema_cross=body.get("ema_cross", body.get("emaCross", "FLAT")),
+        slippage_bps=float(body.get("slippage_bps", body.get("slippageBps", 0))),
+        fee_paid_usdt=float(body.get("fee_paid_usdt", body.get("feePaidUsdt", 0))),
+        experiment_id=str(experiment.get("experimentId") or ""),
+        experiment_arm=str(experiment.get("experimentArm") or ""),
+        policy_version=str(experiment.get("policyVersion") or ""),
+        campaign_id=str(body.get("campaignId", body.get("campaign_id", "")) or ""),
+        mfe_pct=float(body.get("mfePct", body.get("mfe_pct", body.get("mfe", 0)))),
+        mae_pct=float(body.get("maePct", body.get("mae_pct", body.get("mae", 0)))),
+        exit_reason=str(body.get("exitReason", body.get("exit_reason", "")) or ""),
+        latency_drag_usdt=float(body.get("latencyDragUsdt", body.get("latency_drag_usdt", 0))),
+        regime=body.get("regime"),
+        playbook=body.get("playbook"),
+        setup_type=body.get("setupType", body.get("setup_type")),
+        regime_confidence=(
+            float(body["regimeConfidence"])
+            if body.get("regimeConfidence") is not None
+            else None
+        ),
+        playbook_version=body.get("playbookVersion", body.get("playbook_version")),
+        stacking_depth=int(body.get("stackingDepth", body.get("stacking_depth", 1))),
+        execution_priority=float(body.get("executionPriority", body.get("execution_priority", body.get("score", 0))) or 0),
+        coach_score=float(body.get("coachScore", body.get("coach_score", body.get("executionPriority", body.get("score", 0)))) or 0),
+        playbook_score=(
+            float(body.get("playbookScore", body.get("playbook_score")))
+            if body.get("playbookScore", body.get("playbook_score")) is not None
+            else None
+        ),
+        ml_probability=(
+            float(body.get("mlProbability", body.get("calibratedProbability", body.get("calibrated_probability"))))
+            if body.get("mlProbability", body.get("calibratedProbability", body.get("calibrated_probability"))) is not None
+            else None
+        ),
+        execution_quality=(
+            float(body.get("executionQuality", body.get("execution_quality")))
+            if body.get("executionQuality", body.get("execution_quality")) is not None
+            else None
+        ),
+        signal_id=str(body.get("signalId", body.get("signal_id", "")) or ""),
+        entry_aggressive_score=(
+            float(body.get("aggressiveScore", body.get("entryAggressiveScore", body.get("entry_aggressive_score"))))
+            if body.get("aggressiveScore", body.get("entryAggressiveScore", body.get("entry_aggressive_score"))) is not None
+            else None
+        ),
+        risk_tier=body.get("risk_tier", body.get("riskTier")),
+        size_multiplier=(
+            float(body.get("sizeMultiplier", body.get("size_multiplier")))
+            if body.get("sizeMultiplier", body.get("size_multiplier")) is not None
+            else None
+        ),
+        size_reason=body.get("size_reason", body.get("sizeReason")),
+        recommended_margin=(
+            float(body.get("recommendedMargin", body.get("recommended_margin")))
+            if body.get("recommendedMargin", body.get("recommended_margin")) is not None
+            else None
+        ),
+        recommended_leverage=(
+            float(body.get("recommendedLeverage", body.get("recommended_leverage")))
+            if body.get("recommendedLeverage", body.get("recommended_leverage")) is not None
+            else None
+        ),
+        max_loss_if_stop=(
+            float(body.get("maxLossIfStop", body.get("max_loss_if_stop")))
+            if body.get("maxLossIfStop", body.get("max_loss_if_stop")) is not None
+            else None
+        ),
+        notional=(
+            float(body.get("notional"))
+            if body.get("notional") is not None
+            else None
+        ),
+    )
+    execution_audit = await record_trade_audit(body)
 
     # Invalida cache relacionado
     _response_cache.clear()
@@ -934,11 +919,117 @@ async def record_trade(body: dict):
     return {
         "ok": True,
         "recorded": recorded,
-        "duplicate": not recorded,
-        "sourceId": source_id,
         "symbol": body["symbol"],
         "pnl_pct": float(pnl_pct),
+        "experiment": experiment,
+        "executionAudit": execution_audit,
     }
+
+
+@app.post("/execution/audit/trade")
+async def record_execution_audit_trade(body: dict):
+    """Audit one closed trade execution payload without recording a KB trade outcome."""
+    if "symbol" not in body:
+        raise HTTPException(400, "Required field: symbol")
+    return await record_trade_audit(body)
+
+
+@app.post("/kb/trades/batch")
+async def record_trades_batch(body: list[dict]):
+    """Record a batch of trade outcomes and execution audits."""
+    if not isinstance(body, list):
+        raise HTTPException(400, "Expected a JSON array")
+    results = []
+    for item in body[:200]:
+        if not isinstance(item, dict):
+            continue
+        side = item.get("positionSide") or item.get("position_side") or item.get("side")
+        if not item.get("symbol") or not side:
+            continue
+        eligibility = validate_learning_eligibility(item)
+        if not eligibility.learning_eligible:
+            results.append({
+                "sourceId": str(item.get("id") or ""),
+                "recorded": False,
+                "blockedReasons": eligibility.blocked_reasons,
+            })
+            continue
+        pnl_pct = item.get("pnl_pct")
+        if pnl_pct is None:
+            realized_pnl = float(item.get("realizedPnl", item.get("realized_pnl", 0)))
+            margin_used = float(item.get("marginUsed", item.get("margin_used", 0)))
+            pnl_pct = (realized_pnl / margin_used * 100) if margin_used > 0 else realized_pnl
+        pnl_usdt = item.get("pnl_usdt", item.get("realizedPnl", 0))
+        experiment = await infer_assignment_for_outcome(item) or {}
+        recorded = await kb.record_trade_outcome(
+            source_id=str(item.get("id") or "") or None,
+            source=str(item.get("source") or "manual"),
+            is_demo=bool(item.get("isDemo", item.get("is_demo", False))),
+            symbol=item["symbol"],
+            side=side,
+            pnl_pct=float(pnl_pct),
+            pnl_usdt=float(pnl_usdt) if pnl_usdt else 0.0,
+            entry_price=float(item.get("entry_price", item.get("entryPrice", 0))),
+            exit_price=float(item.get("exit_price", item.get("exitPrice", 0))),
+            oi_change=float(item.get("oi_change", item.get("oiChange", 0))),
+            funding=float(item.get("funding", item.get("fundingRate", 0))),
+            volume_ratio=float(item.get("volume_ratio", item.get("volumeRatio", 1))),
+            btc_regime=item.get("btc_regime", item.get("btcRegime", "NEUTRAL")),
+            rsi=float(item.get("rsi", item.get("rsiAtEntry", 50))),
+            ema_cross=item.get("ema_cross", item.get("emaCross", "FLAT")),
+            slippage_bps=float(item.get("slippage_bps", item.get("slippageBps", 0))),
+            fee_paid_usdt=float(item.get("fee_paid_usdt", item.get("feePaidUsdt", 0))),
+            experiment_id=str(experiment.get("experimentId") or ""),
+            experiment_arm=str(experiment.get("experimentArm") or ""),
+            policy_version=str(experiment.get("policyVersion") or ""),
+            campaign_id=str(item.get("campaignId", item.get("campaign_id", "")) or ""),
+            mfe_pct=float(item.get("mfePct", item.get("mfe_pct", item.get("mfe", 0)))),
+            mae_pct=float(item.get("maePct", item.get("mae_pct", item.get("mae", 0)))),
+            exit_reason=str(item.get("exitReason", item.get("exit_reason", "")) or ""),
+            latency_drag_usdt=float(item.get("latencyDragUsdt", item.get("latency_drag_usdt", 0))),
+            regime=item.get("regime"),
+            playbook=item.get("playbook"),
+            setup_type=item.get("setupType", item.get("setup_type")),
+            stacking_depth=int(item.get("stackingDepth", item.get("stacking_depth", 1))),
+            execution_priority=float(item.get("executionPriority", item.get("execution_priority", item.get("score", 0))) or 0),
+            coach_score=float(item.get("coachScore", item.get("coach_score", item.get("executionPriority", item.get("score", 0)))) or 0),
+            playbook_score=(
+                float(item.get("playbookScore", item.get("playbook_score")))
+                if item.get("playbookScore", item.get("playbook_score")) is not None
+                else None
+            ),
+            ml_probability=(
+                float(item.get("mlProbability", item.get("calibratedProbability", item.get("calibrated_probability"))))
+                if item.get("mlProbability", item.get("calibratedProbability", item.get("calibrated_probability"))) is not None
+                else None
+            ),
+            execution_quality=(
+                float(item.get("executionQuality", item.get("execution_quality")))
+                if item.get("executionQuality", item.get("execution_quality")) is not None
+                else None
+            ),
+            signal_id=str(item.get("signalId", item.get("signal_id", "")) or ""),
+            entry_aggressive_score=(
+                float(item.get("aggressiveScore", item.get("entryAggressiveScore", item.get("entry_aggressive_score"))))
+                if item.get("aggressiveScore", item.get("entryAggressiveScore", item.get("entry_aggressive_score"))) is not None
+                else None
+            ),
+        )
+        audit = await record_trade_audit(item)
+        results.append({
+            "sourceId": str(item.get("id") or ""),
+            "recorded": recorded,
+            "experiment": experiment,
+            "executionQuality": audit["executionQuality"],
+        })
+    _response_cache.clear()
+    return {"ok": True, "count": len(results), "results": results}
+
+
+@app.get("/execution/audit")
+async def get_execution_audit_endpoint(hours: int = Query(24, ge=1, le=720)):
+    """Latency, slippage and execution-drag report for sniper fills."""
+    return await get_execution_audit_report(hours=hours)
 
 
 @app.get("/kb/trades/summary")
@@ -954,6 +1045,17 @@ async def get_recent_trade_outcomes(
 ):
     """Trades realizados recentes em formato compatível com o dashboard."""
     return await kb.get_recent_trade_outcomes(source=source, limit=limit)
+
+
+@app.get("/score-calibration/status")
+@cache_response(ttl_seconds=20)
+async def get_score_calibration_status(
+    days: int = Query(30, ge=1, le=365),
+    limit: int = Query(5000, ge=50, le=20000),
+):
+    """Score Truth Engine: compara scores operacionais contra PnL realizado."""
+    rows = await kb.get_score_calibration_rows(days=days, limit=limit)
+    return run_score_calibration(rows)
 
 
 @app.get("/kb/feature-history/{symbol}")
@@ -979,190 +1081,231 @@ async def recommend_entry_endpoint(body: dict, days: int = Query(30, ge=1, le=36
 
 @app.post("/edge/evaluate")
 async def evaluate_edge_endpoint(body: dict):
-    """Authoritative edge gate: backend sends pending entry context, Quant Brain returns allow/reject."""
+    """
+    Authoritative edge gate (Judge Sniper + Coach Ranker dual layer).
+    Judge blocks fatal conditions only; Coach scores and ranks.
+    """
     if "symbol" not in body:
         raise HTTPException(400, "Required field: symbol")
     try:
-        return await job_supervisor.execute(
-            f"inference:{body['symbol']}",
-            lambda: evaluate_edge_gate(body),
-            priority="inference",
-            timeout_seconds=25,
-            queue_timeout_seconds=2,
-        )
+        return await asyncio.wait_for(evaluate_edge_gate(body), timeout=25)
     except asyncio.TimeoutError:
         log.exception("edge evaluate timeout")
-        raise HTTPException(504, "edge_evaluate_timeout")
-    except ValueError as exc:
-        raise HTTPException(422, str(exc))
+        return {
+            "allow": True,
+            "gateRejects": [],
+            "score": 0.0,
+            "authority": "quant-brain-degraded",
+            "mode": "degraded_timeout",
+            "error": "edge_evaluate_timeout",
+        }
     except Exception as exc:
         log.exception("edge evaluate failed")
-        raise HTTPException(503, f"edge_evaluate_failed: {type(exc).__name__}")
-
-
-# ========== MODEL GOVERNANCE ==========
-
-def _governance_thresholds(value: dict | None) -> GovernanceThresholds:
-    raw = value or {}
-    allowed = GovernanceThresholds.__dataclass_fields__.keys()
-    return GovernanceThresholds(**{
-        key: raw[key] for key in allowed if key in raw
-    })
-
-
-def _campaign_observation(value: dict) -> CampaignObservation:
-    aliases = {
-        "candidate_id": "candidateId",
-        "campaign_id": "campaignId",
-        "observed_at": "observedAt",
-        "label_end_at": "labelEndAt",
-        "net_vst": "netVst",
-        "candidate_accepted": "candidateAccepted",
-        "baseline_accepted": "baselineAccepted",
-        "champion_accepted": "championAccepted",
-        "operational_ok": "operationalOk",
-        "predicted_probability": "predictedProbability",
-    }
-    normalized = {
-        field: value.get(field, value.get(alias))
-        for field, alias in aliases.items()
-    }
-    normalized.update({
-        "symbol": value.get("symbol"),
-        "side": value.get("side"),
-        "regime": value.get("regime"),
-        "outcome": value.get("outcome"),
-    })
-    if normalized["operational_ok"] is None:
-        normalized["operational_ok"] = True
-    return CampaignObservation(**normalized)
-
-
-@app.get("/governance/status")
-async def governance_status_endpoint():
-    return governance_store.status()
-
-
-@app.post("/governance/candidates")
-async def register_governance_candidate_endpoint(body: dict):
-    try:
-        artifact = base64.b64decode(
-            str(body["artifactBase64"]),
-            validate=True,
-        )
-        versions = VersionSet(
-            feature=str(body["featureVersion"]),
-            label=str(body["labelVersion"]),
-            policy=str(body["policyVersion"]),
-        )
-        artifact_sha256 = governance_store.put_artifact(
-            artifact,
-            {
-                "candidateId": body["candidateId"],
-                "kind": body["kind"],
-                "versions": {
-                    "feature": versions.feature,
-                    "label": versions.label,
-                    "policy": versions.policy,
-                },
-                "format": body.get("artifactFormat", "opaque"),
-            },
-        )
-        candidate = governance_store.register(CandidateSpec(
-            candidate_id=str(body["candidateId"]),
-            kind=str(body["kind"]),
-            versions=versions,
-            artifact_sha256=artifact_sha256,
-            created_at=time.time(),
-            parent_candidate_id=body.get("parentCandidateId"),
-            metadata=dict(body.get("metadata") or {}),
-        ))
         return {
-            "candidate": candidate.__dict__,
-            "artifactSha256": artifact_sha256,
+            "allow": True,
+            "gateRejects": [],
+            "score": 0.0,
+            "authority": "quant-brain-degraded",
+            "mode": "degraded_error",
+            "error": f"{type(exc).__name__}: {exc}",
         }
-    except (KeyError, TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/governance/observations")
-async def record_governance_observations_endpoint(body: dict):
-    try:
-        observations = [
-            _campaign_observation(item)
-            for item in body.get("observations", [])
-        ]
-        if not observations:
-            raise ValueError("at least one campaign observation is required")
-        appended = governance_store.append_observations(observations)
-        monitors = {}
-        thresholds = _governance_thresholds(body.get("thresholds"))
-        for candidate_id in sorted({row.candidate_id for row in observations}):
-            candidate = governance_store.get(candidate_id)
-            if candidate.state not in {"review", "champion"}:
-                continue
-            monitors[candidate_id] = monitor_and_demote(
-                governance_store,
-                candidate_id,
-                governance_store.observations(candidate_id, limit=500),
-                thresholds,
+@app.post("/position-sizing/evaluate")
+async def evaluate_position_sizing_endpoint(body: dict):
+    """Calculate compounding-aware margin/leverage for one candidate."""
+    if "symbol" not in body:
+        raise HTTPException(400, "Required field: symbol")
+    return calculate_position_size(body)
+
+
+@app.get("/position-sizing/status")
+async def position_sizing_status_endpoint(
+    source: str = Query("all", pattern="^(all|demo|live)$"),
+    limit: int = Query(500, ge=1, le=2000),
+    equity: float = Query(0.0, ge=0.0),
+):
+    """Risk-tier performance and compounding curve from recent realized trades."""
+    trades = await kb.get_recent_trade_outcomes(source=source, limit=limit)
+    inferred_equity = equity if equity > 0 else float(os.environ.get("POSITION_SIZING_EQUITY_FALLBACK", "1000"))
+    return build_position_sizing_status(trades, inferred_equity, {})
+
+
+@app.post("/cycle/rank")
+async def rank_cycle_candidates(body: dict):
+    """
+    Coach Ranker batch endpoint.
+
+    Receives all sniper cycle candidates in one request, runs Judge + Coach
+    on each, and returns them sorted by executionPriority (highest first).
+
+    Request body:
+      candidates  — list of entry contexts (same schema as /edge/evaluate body)
+      config      — shared bot config (applied to all candidates)
+      btcRegime   — current BTC regime string (optional)
+      btcChangePct — BTC price change % (optional)
+      hourUtc     — current UTC hour (optional)
+
+    Response:
+      ranked      — list of {symbol, positionSide, allow, executionPriority,
+                             judgeSniper, coachRanker, gateRejects, score, aggressiveScore}
+      totalCandidates — int
+      allowed     — int
+      blocked     — int
+    """
+    candidates_raw = body.get("candidates")
+    if not candidates_raw or not isinstance(candidates_raw, list):
+        raise HTTPException(400, "Required field: candidates (non-empty list)")
+
+    shared_config = body.get("config") or {}
+    shared_btc_regime = body.get("btcRegime")
+    shared_btc_change = body.get("btcChangePct")
+    shared_hour = body.get("hourUtc")
+
+    async def _evaluate_one(candidate: dict) -> dict:
+        merged = {**candidate}
+        if shared_config and "config" not in merged:
+            merged["config"] = shared_config
+        elif shared_config:
+            merged["config"] = {**shared_config, **(merged.get("config") or {})}
+        if shared_btc_regime and "btcRegime" not in merged:
+            merged["btcRegime"] = shared_btc_regime
+        if shared_btc_change is not None and "btcChangePct" not in merged:
+            merged["btcChangePct"] = shared_btc_change
+        if shared_hour is not None and "hourUtc" not in merged:
+            merged["hourUtc"] = shared_hour
+        try:
+            result = await asyncio.wait_for(evaluate_edge_gate(merged), timeout=20)
+        except asyncio.TimeoutError:
+            result = {
+                "allow": True, "gateRejects": [], "score": 0.0,
+                "aggressiveScore": 0.0, "executionPriority": 0.0,
+                "authority": "quant-brain-degraded", "mode": "degraded_timeout",
+                "symbol": merged.get("symbol", ""), "positionSide": merged.get("positionSide", ""),
+            }
+        except Exception as exc:
+            result = {
+                "allow": True, "gateRejects": [], "score": 0.0,
+                "aggressiveScore": 0.0, "executionPriority": 0.0,
+                "authority": "quant-brain-degraded", "mode": "degraded_error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "symbol": merged.get("symbol", ""), "positionSide": merged.get("positionSide", ""),
+            }
+        return result
+
+    results = await asyncio.gather(*[_evaluate_one(c) for c in candidates_raw])
+
+    allowed_results = [r for r in results if r.get("allow", True)]
+    blocked_results = [r for r in results if not r.get("allow", True)]
+
+    ranked = sorted(
+        allowed_results,
+        key=lambda r: float(r.get("executionPriority", r.get("score", 0.0))),
+        reverse=True,
+    )
+
+    return {
+        "ranked": ranked,
+        "blocked": blocked_results,
+        "totalCandidates": len(results),
+        "allowed": len(allowed_results),
+        "blockedCount": len(blocked_results),
+        "mode": "judge-coach-dual-layer-v1",
+    }
+
+
+@app.get("/regime-playbook/status")
+@cache_response(ttl_seconds=10)
+async def regime_playbook_status_endpoint(days: int = Query(30, ge=1, le=365)):
+    """
+    Current regime/playbook map plus historical performance by playbook.
+    """
+    snaps = engine.get_all_snapshots()
+    btc_snap = snaps.get("BTC-USDT")
+    performance = await kb.get_playbook_performance(days=days)
+    report = await kb.get_playbook_report(days=days)
+    breadth_values = [
+        snap.price_change_pct
+        for symbol, snap in snaps.items()
+        if symbol != "BTC-USDT"
+    ]
+    market_breadth = (
+        sum(1 for value in breadth_values if value > 0) / len(breadth_values)
+        if breadth_values
+        else 0.5
+    )
+
+    active_by_symbol: dict[str, Any] = {}
+    for symbol, snap in snaps.items():
+        if symbol == "BTC-USDT":
+            continue
+        try:
+            alt_history = get_snapshot_history(symbol, 900)
+            btc_history = get_snapshot_history("BTC-USDT", 900)
+            sniper = evaluate_sniper_window(
+                symbol,
+                alt_history,
+                btc_history,
+                target_moves_pct={"configured": 0.3, "0.5": 0.5, "1.0": 1.0, "2.0": 2.0},
             )
-        return {"appended": appended, "monitors": monitors}
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"unknown candidate: {exc}") from exc
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.post("/governance/evaluate/{candidate_id}")
-async def evaluate_governance_candidate_endpoint(candidate_id: str, body: dict):
-    try:
-        candidate = governance_store.get(candidate_id)
-        observations = governance_store.observations(candidate_id)
-        evidence = evaluate_candidate(
-            candidate,
-            observations,
-            _governance_thresholds(body.get("thresholds")),
-        )
-        governance_store.put_evidence(evidence)
-        if candidate.state == "shadow":
-            governance_store.transition(
-                candidate_id,
-                "review",
-                "walk-forward evidence recorded; awaiting promotion decision",
-                evidence_digest=evidence["evidence_digest"],
+            alt_features = sniper.get("altFeatures") or {}
+            correlation = 0.0
+            sample_count = min(len(alt_history), len(btc_history), 60)
+            if sample_count >= 10:
+                alt_change = float(alt_history[-1].get("price_change_pct", 0) or 0)
+                btc_change = float(btc_history[-1].get("price_change_pct", 0) or 0)
+                correlation = 0.6 if alt_change * btc_change > 0 else 0.2
+            spread_bps = float(alt_features.get("spread_bps") or snap.spread_bps or 0)
+            liquidity_score = max(0.0, min(1.0, 1.0 - spread_bps / 30.0))
+            news_context = await kb.get_active_news_context(symbol)
+            active_by_symbol[symbol] = classify_regime_playbook(
+                symbol=symbol,
+                position_side="LONG" if snap.price_change_pct >= 0 else "SHORT",
+                btc_regime=(btc_snap.btc_regime if btc_snap else snap.btc_regime),
+                btc_volatility_pct=(btc_snap.atr_pct if btc_snap else 0.0),
+                btc_trend_strength=(btc_snap.price_change_pct if btc_snap else 0.0),
+                alt_btc_correlation=correlation,
+                symbol_momentum=float(alt_features.get("price_change_pct") or snap.price_change_pct),
+                volume_ratio=float(alt_features.get("volume_ratio") or snap.volume_ratio),
+                oi_change_pct=float(alt_features.get("oi_change_pct") or snap.oi_change_pct),
+                spread_bps=spread_bps,
+                liquidity_score=liquidity_score,
+                candle_context=sniper.get("altTimeframes") or {},
+                market_breadth=market_breadth,
+                funding_rate=float(alt_features.get("funding_rate") or snap.funding_rate),
+                news_context=news_context,
+                operational_risk=_runtime_state.get("operational_risk") or {},
+                playbook_performance=performance,
             )
-        return evidence
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"unknown candidate: {exc}") from exc
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            active_by_symbol[symbol] = {
+                "regime": "LOW_LIQUIDITY",
+                "playbook": "AVOID_MODE",
+                "allowedSetups": [],
+                "blockedSetups": ["UNKNOWN_DATA_QUALITY"],
+                "scoreAdjustments": {"minScoreBoost": 0.16},
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
+    current_regimes: dict[str, int] = defaultdict(int)
+    for item in active_by_symbol.values():
+        current_regimes[str(item.get("regime", "UNKNOWN"))] += 1
 
-@app.post("/governance/promote/{candidate_id}")
-async def promote_governance_candidate_endpoint(candidate_id: str, body: dict):
-    try:
-        evidence = governance_store.get_evidence(str(body["evidenceDigest"]))
-        candidate = promote_candidate(governance_store, candidate_id, evidence)
-        return {"candidate": candidate.__dict__}
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.post("/governance/rollback/{candidate_id}")
-async def rollback_governance_candidate_endpoint(candidate_id: str, body: dict):
-    try:
-        restored = governance_store.rollback(
-            candidate_id,
-            str(body.get("reason") or "operator-requested rollback"),
-        )
-        return {"restoredChampion": restored.__dict__}
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "timestamp": time.time(),
+        "regimeCurrent": dict(current_regimes),
+        "activeBySymbol": active_by_symbol,
+        "allowedPlaybooks": [
+            "MOMENTUM_BREAKOUT_SCALP",
+            "PULLBACK_CONTINUATION",
+            "RANGE_QUICK_SCALP",
+            "LIQUIDITY_SWEEP_REVERSAL",
+            "BTC_LEAD_ALT_FOLLOW",
+            "AVOID_MODE",
+        ],
+        "performanceByPlaybook": performance,
+        "report": report,
+    }
 
 
 # ========== SIGNALS ==========
@@ -1170,31 +1313,187 @@ async def rollback_governance_candidate_endpoint(candidate_id: str, body: dict):
 @app.post("/signals/finalize")
 async def finalize_signals_endpoint():
     """Finalize pending signal outcomes after the 300s sniper validation window."""
-    return await job_supervisor.execute(
-        "finalize_signals",
-        finalize_due_signal_outcomes,
-        priority="reconciliation",
-        timeout_seconds=30,
-        queue_timeout_seconds=5,
-        lock_key="finalize-signals",
-        retry_budget=1,
+    return await finalize_due_signal_outcomes()
+
+
+@app.post("/signal/lifecycle")
+async def record_signal_lifecycle_event(body: dict):
+    """Record a signal lifecycle event from the trading bot (fire-and-forget from API server)."""
+    for r in ("eventType", "symbol", "side"):
+        if r not in body:
+            raise HTTPException(400, f"Required field: {r}")
+    score_raw = body.get("score")
+    await kb.record_lifecycle_event(
+        event_type=str(body["eventType"]),
+        symbol=str(body["symbol"]),
+        side=str(body["side"]),
+        signal_id=body.get("signalId"),
+        score=float(score_raw) if score_raw is not None else None,
+        risk_profile=body.get("riskProfile"),
+        is_demo=bool(body.get("isDemo", True)),
+        metadata=body.get("metadata"),
+    )
+    return {"ok": True}
+
+
+@app.get("/metrics/learning")
+@cache_response(ttl_seconds=30)
+async def get_learning_metrics_endpoint(hours: int = Query(24, ge=1, le=168)):
+    """
+    Learning velocity and score-bucket metrics.
+    Use this to verify whether high-score trades outperform low-score trades
+    — the primary signal that the Coach Ranker is becoming a real teacher.
+    """
+    return await kb.get_learning_metrics(hours=hours)
+
+
+# ── Exit Intelligence endpoints ──────────────────────────────────────────────
+
+@app.post("/exit/evaluate")
+async def exit_evaluate_endpoint(body: dict):
+    """
+    Evaluate an open position and recommend an exit action.
+
+    Called by the demo monitor every cycle for each open position.
+    Fetches current market data internally (snapshot history + sniper window).
+    Never blocks — returns HOLD on any internal error.
+    """
+    symbol = body.get("symbol", "")
+    position_side = body.get("positionSide") or body.get("position_side") or "LONG"
+    if not symbol:
+        raise HTTPException(400, "symbol required")
+
+    try:
+        result = evaluate_exit(
+            symbol=symbol.upper(),
+            position_side=str(position_side).upper(),
+            entry_price=float(body.get("entryPrice", body.get("entry_price", 0))),
+            current_price=float(body.get("currentPrice", body.get("current_price", 0))),
+            unrealized_pnl_pct=float(body.get("unrealizedPnlPct", body.get("unrealized_pnl_pct", 0))),
+            age_seconds=float(body.get("ageSeconds", body.get("age_seconds", 0))),
+            tp_pct=float(body.get("tpPct", body.get("tp_pct", 0.3))),
+            sl_pct=float(body.get("slPct", body.get("sl_pct", 0.2))),
+            mfe_pct=float(body.get("mfePct", body.get("mfe_pct", 0))),
+            mae_pct=float(body.get("maePct", body.get("mae_pct", 0))),
+            aggressive_score=float(body.get("aggressiveScore", body.get("aggressive_score", 0.5))),
+            campaign_depth=int(body.get("campaignDepth", body.get("campaign_depth", 1))),
+            campaign_drawdown_pct=float(body.get("campaignDrawdownPct", body.get("campaign_drawdown_pct", 0))),
+            btc_regime=str(body.get("btcRegime", body.get("btc_regime", "NEUTRAL"))),
+            regime_playbook=body.get("regimePlaybook") or {},
+            playbook=body.get("playbook"),
+        )
+    except Exception as exc:
+        # Never crash the monitor — return safe HOLD
+        return {
+            "action": "HOLD",
+            "confidence": 0.5,
+            "reason": f"evaluation_error: {exc}",
+            "shouldClose": False,
+            "shouldStack": True,
+            "stackingAction": None,
+            "protectionLevel": "normal",
+            "suggestedStopPct": float(body.get("slPct", 0.2)),
+            "suggestedTakeProfitPct": float(body.get("tpPct", 0.3)),
+            "adaptiveTpSl": {"tpPct": float(body.get("tpPct", 0.3)), "slPct": float(body.get("slPct", 0.2)), "rationale": "fallback"},
+            "context": {},
+            "version": "exit-intelligence-v1",
+        }
+
+    # Persist evaluation for outcome correlation (fire-and-forget — don't let
+    # DB errors block the response)
+    source_id = str(body.get("orderId") or "")
+    if source_id:
+        try:
+            await record_exit_evaluation(
+                source_id=source_id,
+                symbol=symbol.upper(),
+                side=str(position_side).upper(),
+                action=result["action"],
+                confidence=float(result["confidence"]),
+                reason=str(result["reason"]),
+                suggested_stop_pct=float(result["suggestedStopPct"]),
+                suggested_tp_pct=float(result["suggestedTakeProfitPct"]),
+                should_close=result["shouldClose"],
+                should_stack=result["shouldStack"],
+                protection_level=str(result["protectionLevel"]),
+                unrealized_pnl_pct=float(body.get("unrealizedPnlPct", 0)),
+                mfe_pct=float(body.get("mfePct", 0)),
+                age_seconds=float(body.get("ageSeconds", 0)),
+                momentum_score=float((result.get("context") or {}).get("momentumScore", 0.5)),
+            )
+        except Exception:
+            pass
+
+    return result
+
+
+@app.post("/exit/record-outcome")
+async def exit_record_outcome_endpoint(body: dict):
+    """
+    Record post-trade exit outcome for learning analysis.
+
+    Called after a demo trade closes. Classifies exit quality and persists
+    for Coach Ranker feedback.
+    """
+    required = ["sourceId", "symbol", "pnlPct", "mfePct", "maePct", "ageSeconds", "tpPct", "slPct", "exitReason"]
+    for r in required:
+        if r not in body:
+            raise HTTPException(400, f"Required field: {r}")
+    side = body.get("positionSide") or body.get("side") or "LONG"
+    try:
+        experiment = await infer_assignment_for_outcome(body) or {}
+        result = await _record_exit_outcome(
+            source_id=str(body["sourceId"]),
+            symbol=str(body["symbol"]).upper(),
+            side=str(side).upper(),
+            is_demo=bool(body.get("isDemo", True)),
+            entry_price=float(body.get("entryPrice", 0)),
+            exit_price=float(body.get("exitPrice", 0)),
+            pnl_pct=float(body["pnlPct"]),
+            mfe_pct=float(body["mfePct"]),
+            mae_pct=float(body["maePct"]),
+            age_seconds=float(body["ageSeconds"]),
+            tp_pct=float(body["tpPct"]),
+            sl_pct=float(body["slPct"]),
+            exit_reason=str(body["exitReason"]),
+            exit_action_taken=str(body.get("exitActionTaken") or ""),
+            entry_aggressive_score=float(body.get("aggressiveScore", 0)),
+            btc_regime=str(body.get("btcRegime") or "NEUTRAL"),
+            hour_utc=int(body.get("hourUtc", 0)),
+            campaign_id=str(body.get("campaignId") or ""),
+            experiment_id=str(experiment.get("experimentId") or ""),
+            experiment_arm=str(experiment.get("experimentArm") or ""),
+            policy_version=str(experiment.get("policyVersion") or ""),
+            expected_duration_sec=float(body.get("expectedDurationSec", 300)),
+        )
+        _response_cache.clear()
+        return {"ok": True, **result, "experiment": experiment}
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to record exit outcome: {exc}") from exc
+
+
+@app.get("/exit/stats")
+@cache_response(ttl_seconds=60)
+async def exit_stats_endpoint(
+    symbol: str | None = Query(None),
+    side: str | None = Query(None),
+    days: int = Query(30, ge=1, le=365),
+):
+    """
+    Exit quality analytics — win-rate / PnL / MFE averages by label and action.
+    Used by the Intelligence page and Coach Ranker learning signal.
+    """
+    return await get_exit_stats(
+        symbol=symbol.upper() if symbol else None,
+        side=side.upper() if side else None,
+        days=days,
     )
 
 
 @app.post("/models/sniper/train")
 async def train_sniper_model_endpoint(min_samples: int = Query(300, ge=100, le=100000)):
     """Train and validate the calibrated sniper model; authority remains shadow-only."""
-    try:
-        return await job_supervisor.execute(
-            "manual_model_training",
-            lambda: train_shadow_model(min_samples=min_samples),
-            priority="training",
-            timeout_seconds=max(60, _MODEL_JOB_TIMEOUT_SECONDS),
-            queue_timeout_seconds=2,
-            lock_key="model-training",
-        )
-    except RuntimeError as exc:
-        raise HTTPException(429, f"Training backpressure: {exc}") from exc
+    return await train_shadow_model(min_samples=min_samples)
 
 
 @app.get("/models/sniper/status")
@@ -1204,7 +1503,6 @@ async def sniper_model_status_endpoint():
     await restore_shadow_model()
     status = shadow_model_status()
     progress = await kb.get_signal_training_summary(decision_group=None, source_type=None)
-    readiness = await kb.get_signal_readiness_diagnostics(min_samples=300, source_type=None)
     pipeline = await kb.get_signal_pipeline_summary()
     sources = await kb.get_signal_source_summary()
     recent_shadow = await kb.get_recent_signal_outcomes(limit=10, source_type="shadow_sampler")
@@ -1228,8 +1526,6 @@ async def sniper_model_status_endpoint():
         "misses": progress["misses"],
         "hasBothClasses": progress["hasBothClasses"],
         "trainingMode": "automatic_shadow",
-        "readiness": readiness,
-        "datasetFingerprint": readiness["datasetFingerprint"],
         "signalPipeline": pipeline,
         "signalSources": sources,
         "shadowSampler": sampler_st,
@@ -1244,72 +1540,6 @@ async def sniper_model_status_endpoint():
     }
 
 
-@app.post("/kb/trades/batch")
-async def record_trade_batch(body: list[dict]):
-    """Persist outcome batches without N HTTP requests or N DB acquisitions."""
-    if not isinstance(body, list) or not body or len(body) > 100:
-        raise HTTPException(400, "Body must contain 1..100 trade outcomes")
-
-    normalized = []
-    for item in body:
-        if "symbol" not in item:
-            raise HTTPException(400, "Required field: symbol")
-        side = item.get("positionSide") or item.get("position_side") or item.get("side")
-        if not side:
-            raise HTTPException(400, "Required field: side or positionSide")
-        realized_pnl = float(item.get("realizedPnl", item.get("realized_pnl", 0)))
-        margin_used = float(item.get("marginUsed", item.get("margin_used", 0)))
-        pnl_pct = item.get("pnl_pct")
-        if pnl_pct is None:
-            pnl_pct = (realized_pnl / margin_used * 100) if margin_used > 0 else realized_pnl
-        normalized.append({
-            "source_id": str(item.get("id") or "") or None,
-            "source": str(item.get("source") or "manual"),
-            "is_demo": bool(item.get("isDemo", item.get("is_demo", False))),
-            "symbol": item["symbol"],
-            "side": side,
-            "pnl_pct": float(pnl_pct),
-            "pnl_usdt": float(item.get("pnl_usdt", realized_pnl) or 0),
-            "entry_price": float(item.get("entry_price", item.get("entryPrice", 0))),
-            "exit_price": float(item.get("exit_price", item.get("exitPrice", 0))),
-            "oi_change": float(item.get("oi_change", item.get("oiChange", 0))),
-            "funding": float(item.get("funding", item.get("fundingRate", 0))),
-            "volume_ratio": float(item.get("volume_ratio", item.get("volumeRatio", 1))),
-            "btc_regime": item.get("btc_regime", item.get("btcRegime", "NEUTRAL")),
-            "rsi": float(item.get("rsi", item.get("rsiAtEntry", 50))),
-            "ema_cross": item.get("ema_cross", item.get("emaCross", "FLAT")),
-            "slippage_bps": float(item.get("slippage_bps", item.get("slippageBps", 0))),
-            "fee_paid_usdt": float(item.get("fee_paid_usdt", item.get("feePaidUsdt", 0))),
-            "signal_id": str(item.get("signalId") or "") or None,
-            "label_version": str(item.get("labelVersion") or "campaign-pnl-v1"),
-        })
-
-    try:
-        results = await job_supervisor.execute(
-            f"reconcile_batch:{len(normalized)}",
-            lambda: kb.record_trade_outcomes_batch(normalized),
-            priority="reconciliation",
-            timeout_seconds=20,
-            queue_timeout_seconds=5,
-            retry_budget=1,
-        )
-    except (asyncio.TimeoutError, RuntimeError) as exc:
-        raise HTTPException(503, f"Reconciliation backpressure: {exc}") from exc
-
-    _response_cache.clear()
-    return {
-        "ok": True,
-        "received": len(normalized),
-        "recorded": sum(1 for result in results if result),
-        "duplicates": sum(1 for result in results if not result),
-    }
-
-
-@app.get("/monitoring/drift")
-async def drift_monitoring_endpoint():
-    return await evaluate_drift()
-
-
 @app.get("/signals/shadow-sampler/status")
 async def shadow_sampler_status_endpoint():
     return {
@@ -1322,14 +1552,7 @@ async def shadow_sampler_status_endpoint():
 
 @app.post("/signals/shadow-sampler/run")
 async def run_shadow_sampler_once_endpoint():
-    result = await job_supervisor.execute(
-        "manual_shadow_sampler",
-        lambda: sample_shadow_signals_once(engine),
-        priority="inference",
-        timeout_seconds=_SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS,
-        queue_timeout_seconds=2,
-        lock_key="manual-shadow-sampler",
-    )
+    result = await sample_shadow_signals_once(engine)
     return {
         "ok": True,
         "sampler": shadow_sampler_status(),

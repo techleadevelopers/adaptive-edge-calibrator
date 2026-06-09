@@ -42,6 +42,8 @@ Quant Brain responde:
 - comparação Brier contra baseline, AUC, qualidade de dados e simulação de
   lucratividade;
 - contrato rígido `edge-v3` com proveniência;
+- `/edge/evaluate` e `/cycle/rank` falham fechado em timeout/erro, retornando
+  `allow=false`, `available=false` e reject reasons estruturadas;
 - drift monitor com thresholds configuráveis;
 - governança champion/challenger com artefatos content-addressed e audit log;
 - auditor de execução com latência, slippage, spread, price move durante
@@ -246,11 +248,14 @@ Status e treinamento:
 
 ```text
 POST /models/sniper/train
+GET  /models/sniper/train/status
 GET  /models/sniper/status
 ```
 
-O modelo continua shadow. Treinar não promove automaticamente autoridade de
-execução.
+`POST /models/sniper/train` agenda um job em background e retorna `accepted` e
+`statusUrl`. O fit do sklearn roda fora do event loop com lock global de treino,
+para não bloquear healthchecks, snapshots ou `/edge/evaluate`. O modelo continua
+shadow. Treinar não promove automaticamente autoridade de execução.
 
 ## Lucratividade E Calibração
 
@@ -451,7 +456,8 @@ RETENTION_TRADE_OUTCOMES_DAYS=0
 ## Runtime Jobs
 
 O `JobSupervisor` aplica concorrência limitada, prioridade, timeout, heartbeat,
-stale detection e lock de treinamento.
+stale detection, limite de fila, reserva para jobs prioritários e lock de
+treinamento.
 
 | Job | Default | Papel |
 |---|---:|---|
@@ -465,12 +471,20 @@ Variáveis:
 
 ```env
 JOB_MAX_CONCURRENCY=2
+JOB_MAX_QUEUE_SIZE=256
+JOB_RESERVED_PRIORITY=1
 JOB_STALE_AFTER_SECONDS=120
 TACTICAL_JOB_TIMEOUT_SECONDS=20
 SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS=25
 MODEL_JOB_TIMEOUT_SECONDS=45
 MACRO_CANDLE_JOB_TIMEOUT_SECONDS=30
+CYCLE_RANK_MAX_CANDIDATES=50
+SHADOW_MODEL_RF_N_JOBS=1
 ```
+
+`CYCLE_RANK_MAX_CANDIDATES` limita payloads pesados de ranking. Excesso retorna
+HTTP `413`. `SHADOW_MODEL_RF_N_JOBS=1` evita que o RandomForest consuma todos os
+cores em produção.
 
 ## Saúde E Observabilidade
 
@@ -582,6 +596,7 @@ GET  /signals/edge/{symbol}
 GET  /signals/shadow-sampler/status
 POST /signals/shadow-sampler/run
 POST /models/sniper/train
+GET  /models/sniper/train/status
 GET  /models/sniper/status
 
 POST /news/events
@@ -630,6 +645,20 @@ DATABASE_URL=${{Postgres.DATABASE_URL}}
 QUANT_BRAIN_DB_SCHEMA=quant_brain
 QUANT_BRAIN_API_TOKEN=<segredo-compartilhado>
 FRONTEND_URLS=https://seu-dashboard.example
+```
+
+Variáveis operacionais recomendadas para produção:
+
+```env
+JOB_MAX_CONCURRENCY=2
+JOB_MAX_QUEUE_SIZE=256
+JOB_RESERVED_PRIORITY=1
+CYCLE_RANK_MAX_CANDIDATES=50
+RATE_LIMIT_REQUESTS=100
+RATE_LIMIT_WINDOW_SECONDS=60
+ENABLE_API_CACHE=true
+CACHE_TTL_SECONDS=30
+SHADOW_MODEL_RF_N_JOBS=1
 ```
 
 ## Testes

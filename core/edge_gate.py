@@ -20,6 +20,7 @@ from core.signal_learning import (
     score_signal_context,
 )
 from core.shadow_model import predict_shadow
+from core.training_serving_skew import record_serving_vector
 from core.database import connect
 from layers.tactical import get_snapshot_history
 from core.judge_sniper import judge_entry, judge_high_sample_context
@@ -759,21 +760,32 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     ev_samples = int(effective_stats.get("samples", 0))
 
     # ── Shadow ML ────────────────────────────────────────────────────────────
-    shadow_ml = await run_edge_blocking(
-        predict_shadow,
-        {
-            "symbol": symbol,
-            "side": signal_memory["side"],
-            "context_key": signal_memory["contextKey"],
-            "target_configured_move_pct": target_moves_pct["configured"],
-            "estimated_cost_pct": cost_pct,
-            "features": {
-                "alt": sniper["altFeatures"],
-                "btc": sniper["btcFeatures"],
-                "alt_timeframes": sniper["altTimeframes"],
-            },
+    shadow_row = {
+        "symbol": symbol,
+        "side": signal_memory["side"],
+        "context_key": signal_memory["contextKey"],
+        "target_configured_move_pct": target_moves_pct["configured"],
+        "estimated_cost_pct": cost_pct,
+        "features": {
+            "alt": sniper["altFeatures"],
+            "btc": sniper["btcFeatures"],
+            "alt_timeframes": sniper["altTimeframes"],
+            "btc_timeframes": sniper.get("btcTimeframes", {}),
+            "candle_regime": sniper.get("candleRegime", {}),
         },
-    )
+    }
+    shadow_ml = await run_edge_blocking(predict_shadow, shadow_row)
+    if not intelligence_only:
+        try:
+            await record_serving_vector(
+                signal_id=memory_signal_id,
+                prediction_id=str(signal_metadata.get("predictionId") or ""),
+                row=shadow_row,
+                model_version=str(shadow_ml.get("modelVersion") or "shadow-unknown"),
+                feature_version=feature_version,
+            )
+        except Exception:
+            pass
 
     # ── Realized edge recommendation ─────────────────────────────────────────
     recommendation = await recommend_entry({
@@ -917,28 +929,8 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
     # system gathers real data without premature filtering.
     extra_blocks: list[str] = []
     if not is_aggressive:
-        # BTC regime required (direction) — only hard-block in conservative/balanced
-        btc_regime_required = _bool(config.get("btcRegimeRequired"), False)
-        allow_counter = _bool(config.get("allowCounterRegimeScalp"), True)
-        if btc_regime_required:
-            if btc_regime == "NEUTRAL":
-                extra_blocks.append(
-                    f"REGIME_REJECT: BTC change {btc_change_pct:.2f}% < threshold +/-{btc_threshold}%"
-                )
-            elif not allow_counter:
-                want_long = position_side == "LONG"
-                btc_bull = btc_regime == "BULL"
-                if btc_bull != want_long:
-                    extra_blocks.append(
-                        f"REGIME_DIRECTION: BTC {btc_regime} but entry is {position_side}"
-                    )
-
-        # Sentiment counter — hard block only in non-aggressive modes
-        if sentiment_counter and sentiment_confidence >= 0.75 and sentiment_bias_ratio >= 0.72:
-            extra_blocks.append(
-                f"SENTIMENT_COUNTER_REJECT: 24h bias {sentiment_direction} "
-                f"({sentiment_confidence:.0%} conf) conflicts with {position_side}"
-            )
+        # BTC regime and 24h sentiment tags are telemetry only. They must not
+        # hard-block or force LONG/SHORT; candle and edge evidence own direction.
 
         # User-configured WR / PF / EV thresholds
         current_ev = payload.get("currentEv")

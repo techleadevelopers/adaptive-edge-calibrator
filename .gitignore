@@ -17,6 +17,8 @@ venv/
 # runtime data
 data/*.db
 data/*.db-*
+data/shadow-sampler-state.json
+data/models/
 *.sqlite
 *.sqlite3
 *.log

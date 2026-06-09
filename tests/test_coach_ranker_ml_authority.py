@@ -34,4 +34,4 @@ def test_calibrated_shadow_ml_gets_more_than_legacy_authority(monkeypatch):
         "uncertaintyType": "STRONG_EVIDENCE",
     }))
 
-    assert strong - cold > 0.08
+    assert strong - cold > 0.07

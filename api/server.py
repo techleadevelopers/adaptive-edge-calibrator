@@ -67,6 +67,8 @@ _DB_INIT_RETRY_SECONDS = float(os.environ.get("DB_INIT_RETRY_SECONDS", "10"))
 _MODEL_MAINTENANCE_SECONDS = float(os.environ.get("MODEL_MAINTENANCE_SECONDS", "120"))
 _TACTICAL_LOOP_SECONDS = max(5, int(float(os.environ.get("TACTICAL_LOOP_SECONDS", "15"))))
 _JOB_MAX_CONCURRENCY = max(1, int(os.environ.get("JOB_MAX_CONCURRENCY", "2")))
+_JOB_MAX_QUEUE_SIZE = max(1, int(os.environ.get("JOB_MAX_QUEUE_SIZE", "256")))
+_JOB_RESERVED_PRIORITY = max(0, int(os.environ.get("JOB_RESERVED_PRIORITY", "1")))
 _JOB_STALE_AFTER_SECONDS = max(30, int(float(os.environ.get("JOB_STALE_AFTER_SECONDS", "120"))))
 _TACTICAL_JOB_TIMEOUT_SECONDS = max(5, int(float(os.environ.get("TACTICAL_JOB_TIMEOUT_SECONDS", "20"))))
 _SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS = max(5, int(float(os.environ.get("SHADOW_SAMPLER_JOB_TIMEOUT_SECONDS", "25"))))
@@ -75,6 +77,8 @@ _MACRO_CANDLE_ANALYSIS_SECONDS = max(60, int(float(os.environ.get("MACRO_CANDLE_
 _MACRO_CANDLE_JOB_TIMEOUT_SECONDS = max(10, int(float(os.environ.get("MACRO_CANDLE_JOB_TIMEOUT_SECONDS", "30"))))
 job_supervisor = JobSupervisor(
     max_concurrent_jobs=_JOB_MAX_CONCURRENCY,
+    max_queue_size=_JOB_MAX_QUEUE_SIZE,
+    reserved_priority=_JOB_RESERVED_PRIORITY,
     stale_after_seconds=_JOB_STALE_AFTER_SECONDS,
 )
 _RETENTION_MAINTENANCE_SECONDS = float(

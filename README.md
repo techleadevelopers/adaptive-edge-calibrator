@@ -614,11 +614,17 @@ POST /governance/rollback/{candidate_id}
 
 ```powershell
 cd quant-brain
-python -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 Copy-Item .env.example .env
-python main.py
+py -3.12 main.py
+```
+
+Sem venv, use o script local para evitar o Python 3.7 do PATH:
+
+```powershell
+.\scripts\start-local.ps1
 ```
 
 Teste:
@@ -664,7 +670,7 @@ SHADOW_MODEL_RF_N_JOBS=1
 ## Testes
 
 ```powershell
-python -m pytest
+py -3.12 -m pytest
 ```
 
 A suíte cobre contrato, lifecycle shadow, qualidade de mercado, drift,
@@ -674,15 +680,15 @@ governança, job supervisor, banco, calibração e regressões de runtime.
 
 Validações focadas que passaram no estado atual do workspace:
 
-- `python -m py_compile core\knowledge_base.py core\signal_learning.py core\edge_gate.py api\server.py`
-- `python -m py_compile api\kb_trades.py api\server.py tests\test_contract.py`
+- `py -3.12 -m py_compile core\knowledge_base.py core\signal_learning.py core\edge_gate.py api\server.py`
+- `py -3.12 -m py_compile api\kb_trades.py api\server.py tests\test_contract.py`
 - testes focados de mapper/regressão do contrato `/kb/trades`: `3 passed`
-- `python -m pytest -q tests/test_sniper_reconciliation.py tests/test_shadow_lifecycle.py -p no:cacheprovider`: `10 passed`
-- `python -m pytest -q tests/test_contract.py::TestKbTradeContract`: `7 passed`
+- `py -3.12 -m pytest -q tests/test_sniper_reconciliation.py tests/test_shadow_lifecycle.py -p no:cacheprovider`: `10 passed`
+- `py -3.12 -m pytest -q tests/test_contract.py::TestKbTradeContract`: `7 passed`
 
 Validações com bloqueios conhecidos:
 
-- `python -m pytest` a partir da raiz do repositório pode falhar na coleta por
+- `py -3.12 -m pytest` a partir da raiz do repositório pode falhar na coleta por
   diretórios temporários `pytest-cache-files-*` sem permissão. Rode a suíte a
   partir de `quant-brain` ou ignore esses diretórios.
 - Depois de ignorar os diretórios temporários, a coleta completa ainda pode
@@ -698,15 +704,15 @@ Para patches pequenos no contrato backend/Quant Brain, priorize:
 
 ```powershell
 cd quant-brain
-python -m py_compile api\kb_trades.py api\server.py tests\test_contract.py
-python -m pytest -q tests/test_contract.py::TestKbTradeContract
+py -3.12 -m py_compile api\kb_trades.py api\server.py tests\test_contract.py
+py -3.12 -m pytest -q tests/test_contract.py::TestKbTradeContract
 ```
 
 Para patches de reconciliation/shadow, priorize:
 
 ```powershell
 cd quant-brain
-python -m pytest -q tests/test_sniper_reconciliation.py tests/test_shadow_lifecycle.py -p no:cacheprovider
+py -3.12 -m pytest -q tests/test_sniper_reconciliation.py tests/test_shadow_lifecycle.py -p no:cacheprovider
 ```
 
 ## Dados Que Não Devem Ir Para Git
@@ -724,3 +730,4 @@ data/
 
 Segredos exibidos em terminal, editor, screenshot ou chat devem ser revogados e
 substituídos.
+

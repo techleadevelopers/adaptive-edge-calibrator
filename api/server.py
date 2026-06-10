@@ -115,6 +115,22 @@ _training_status: dict[str, Any] = {
 }
 
 
+def _trigger_outcomes_path() -> str:
+    return os.environ.get("TRIGGER_OUTCOMES_PATH", "").strip() or "trigger_outcomes.jsonl"
+
+
+def _append_trigger_outcome(body: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(body)
+    payload.setdefault("ts", int(time.time() * 1000))
+    path = _trigger_outcomes_path()
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return {"ok": True, "path": path, "tag": payload.get("tag"), "signalId": payload.get("signalId")}
+
+
 def _quant_fail_closed(
     reason: str,
     *,
@@ -1329,6 +1345,17 @@ async def get_all_stats(days: int = Query(30, ge=1, le=365)):
     """Estatísticas de todos os símbolos."""
     stats = await kb.get_all_symbols_stats(days)
     return {"period_days": days, "symbols": stats}
+
+
+@app.post("/trigger-outcomes")
+async def record_trigger_outcome(body: dict):
+    """Append backend trigger outcome telemetry to the Quant Brain local JSONL."""
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Expected JSON object")
+    tag = str(body.get("tag") or "").strip()
+    if not tag:
+        raise HTTPException(400, "Required field: tag")
+    return await run_blocking(_append_trigger_outcome, body)
 
 
 @app.post("/kb/trades")

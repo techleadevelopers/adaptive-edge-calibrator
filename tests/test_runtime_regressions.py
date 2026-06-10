@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from core import knowledge_base as kb
-from layers.strategic import build_strategic_report
+from layers.strategic import build_strategic_report, compute_entry_quality_by_symbol
 
 
 class RuntimeRegressionTest(unittest.TestCase):
@@ -80,6 +80,47 @@ class RuntimeRegressionTest(unittest.TestCase):
             report.statistical_tests["win_rate_confidence"]["verdict"],
             "INSUFFICIENT_EVIDENCE",
         )
+
+    def test_entry_quality_uses_signal_hit_rate_without_pnl_pct_column(self) -> None:
+        async def scenario():
+            await kb.init_db()
+            now = 1_800_000_000.0
+            async with kb.connect(kb.DB_PATH) as db:
+                for index in range(6):
+                    await db.execute(
+                        """INSERT INTO signal_outcomes
+                           (signal_id, symbol, side, decision, decision_group, context_key,
+                            features, reasons, entry_price, estimated_cost_pct,
+                            target_050_move_pct, target_100_move_pct, target_200_move_pct,
+                            hit_configured, finalized, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            f"sig-{index}",
+                            "BTC-USDT",
+                            "LONG",
+                            "ALLOW",
+                            "ALLOW",
+                            "ctx",
+                            '{"rsi":42,"volume_ratio":1.8,"oi_change_pct":0.2,"funding_rate":0.01}',
+                            "[]",
+                            100.0,
+                            0.0,
+                            0.5,
+                            1.0,
+                            2.0,
+                            1 if index < 4 else 0,
+                            1,
+                            now,
+                        ),
+                    )
+                await db.commit()
+            with patch("layers.strategic.time.time", return_value=now + 60):
+                return await compute_entry_quality_by_symbol(30)
+
+        quality = asyncio.run(scenario())
+        self.assertIn("BTC-USDT_LONG", quality)
+        self.assertEqual(quality["BTC-USDT_LONG"]["total"], 6)
+        self.assertEqual(quality["BTC-USDT_LONG"]["win_rate"], 66.7)
 
     def test_liveness_does_not_wait_for_database_initialization(self) -> None:
         from api import server

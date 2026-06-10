@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sqlite3
-import tempfile
+import uuid
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -14,15 +15,16 @@ from layers.strategic import build_strategic_report, compute_entry_quality_by_sy
 
 class RuntimeRegressionTest(unittest.TestCase):
     def setUp(self) -> None:
-        tmp_root = Path(os.environ.get("QUANT_BRAIN_TEST_TMP", r"C:\tmp" if os.name == "nt" else str(Path(__file__).parent / ".tmp")))
+        tmp_root = Path(os.environ.get("QUANT_BRAIN_TEST_TMP", str(Path(__file__).parent / ".tmp")))
         tmp_root.mkdir(parents=True, exist_ok=True)
-        self.temp_dir = tempfile.TemporaryDirectory(dir=tmp_root, ignore_cleanup_errors=True)
+        self.temp_dir = tmp_root / f"runtime-regression-{uuid.uuid4().hex}"
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.original_db_path = kb.DB_PATH
-        kb.DB_PATH = Path(self.temp_dir.name) / "knowledge.db"
+        kb.DB_PATH = self.temp_dir / "knowledge.db"
 
     def tearDown(self) -> None:
         kb.DB_PATH = self.original_db_path
-        self.temp_dir.cleanup()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_init_db_migrates_legacy_signal_table_before_indexes(self) -> None:
         db = sqlite3.connect(kb.DB_PATH)

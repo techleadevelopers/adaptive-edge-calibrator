@@ -49,10 +49,17 @@ from core.score_calibration import run_score_calibration
 from core.candle_regime import analyze_macro_candle_regime, candle_regime_status
 from core.regime_playbook import classify_regime_playbook
 from api.kb_trades import record_trade as record_kb_trade
-from layers.tactical import process_tactical_cycle, get_active_alerts, get_snapshot_history
-from layers.strategic import build_strategic_report, report_to_dict, compute_edge_evolution
+from layers.tactical import (
+    process_tactical_cycle, get_active_alerts, get_snapshot_history,
+    compute_sniper_opportunities, compute_all_mass_entry_zones,
+)
+from layers.strategic import (
+    build_strategic_report, report_to_dict, compute_edge_evolution,
+    compute_entry_quality_by_symbol,
+)
 from analyst.ai_analyst import (
-    run_weekly_analysis, run_tactical_analysis, run_hypothesis_generation, _has_ai
+    run_weekly_analysis, run_tactical_analysis, run_hypothesis_generation, _has_ai,
+    run_sniper_analysis, run_mass_entry_scan,
 )
 
 log = logging.getLogger("api")
@@ -932,12 +939,15 @@ async def get_macro_candle_regime():
 async def get_btc_commander(window_seconds: int = Query(int(os.environ.get("SNIPER_WINDOW_SECONDS", "300")), ge=60, le=900)):
     """BTC real-time commander for sniper scalp gating."""
     history = get_snapshot_history("BTC-USDT", window_seconds)
-    features = await run_blocking(
-        build_movement_features,
-        "BTC-USDT",
-        history,
-        window_seconds,
-    )
+    if history:
+        features = await run_blocking(
+            build_movement_features,
+            "BTC-USDT",
+            history,
+            window_seconds,
+        )
+    else:
+        features = build_movement_features("BTC-USDT", [], window_seconds)
     cmd = classify_btc_commander(features)
     # Add aliases so the dashboard can read both field names
     cmd["classification"] = cmd.get("state", "—")
@@ -963,11 +973,19 @@ async def evaluate_sniper_symbol(symbol: str, window_seconds: int = Query(int(os
         sym = f"{sym}-USDT"
     alt_history = get_snapshot_history(sym, window_seconds)
     btc_history = get_snapshot_history("BTC-USDT", window_seconds)
+    if alt_history or btc_history:
+        return await run_blocking(
+            evaluate_sniper_window,
+            sym,
+            alt_history,
+            btc_history,
+            window_seconds=window_seconds,
+        )
     return await run_blocking(
         evaluate_sniper_window,
         sym,
-        alt_history,
-        btc_history,
+        [],
+        [],
         window_seconds=window_seconds,
     )
 
@@ -1112,6 +1130,158 @@ async def generate_hypotheses():
         "model": analysis.model,
         "ai_enabled": _has_ai(),
         "hypotheses": analysis.full_text,
+    }
+
+
+@app.get("/strategic/entry-quality")
+@cache_response(ttl_seconds=120)
+async def get_entry_quality(days: int = Query(30, ge=7, le=90)):
+    """Análise histórica de quais condições geraram as melhores entradas por símbolo/lado."""
+    quality = await compute_entry_quality_by_symbol(days)
+    return {
+        "timestamp": time.time(),
+        "period_days": days,
+        "count": len(quality),
+        "entry_quality": quality,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════
+# SNIPER ENTRY OPPORTUNITIES
+# ════════════════════════════════════════════════════════════════════
+
+@app.get("/sniper/entry-opportunities")
+@cache_response(ttl_seconds=5)
+async def get_sniper_entry_opportunities():
+    """
+    Oportunidades sniper ativas: confluência multi-sinal por símbolo.
+    Retorna apenas símbolos com score >= threshold (0.52).
+    NÃO usa nem modifica a lógica de gatilho — são sinais de entrada independentes.
+    """
+    opps = await compute_sniper_opportunities(engine)
+    snaps = {sym: engine.to_dict(snap) for sym, snap in engine.get_all_snapshots().items()}
+    return {
+        "timestamp": time.time(),
+        "count": len(opps),
+        "threshold": 0.52,
+        "opportunities": [
+            {
+                "symbol":           opp.symbol,
+                "side":             opp.side,
+                "confluence_score": opp.confluence_score,
+                "confidence":       opp.confidence,
+                "entry_price":      opp.entry_price,
+                "signals":          opp.signals,
+                "signal_details":   opp.signal_details,
+                "timestamp":        opp.timestamp,
+            }
+            for opp in opps
+        ],
+        "market_context": {
+            sym: {
+                "rsi":             snap.get("rsi", 50),
+                "volume_ratio":    snap.get("volume_ratio", 1),
+                "oi_change_pct":   snap.get("oi_change_pct", 0),
+                "funding_rate":    snap.get("funding_rate", 0),
+                "price_change_pct":snap.get("price_change_pct", 0),
+                "btc_regime":      snap.get("btc_regime", "UNKNOWN"),
+                "cvd":             snap.get("cvd", 0),
+                "book_imbalance":  snap.get("book_imbalance", 0),
+            }
+            for sym, snap in list(snaps.items())[:8]
+        },
+    }
+
+
+@app.get("/sniper/mass-entry-zones")
+@cache_response(ttl_seconds=5)
+async def get_mass_entry_zones():
+    """
+    Zonas de entrada em massa escalonada (ladder) para oportunidades de alta confluência.
+    Gera N níveis de preço com pesos Kelly-inspirados para entrada distribuída.
+    """
+    opps  = await compute_sniper_opportunities(engine)
+    zones = await compute_all_mass_entry_zones(engine, opps)
+    return {
+        "timestamp":    time.time(),
+        "count":        len(zones),
+        "min_score_for_mass": 0.60,
+        "zones": [
+            {
+                "symbol":             z.symbol,
+                "side":               z.side,
+                "base_price":         z.base_price,
+                "total_confluence":   z.total_confluence,
+                "strategy":           z.strategy,
+                "levels":             z.levels,
+                "timestamp":          z.timestamp,
+            }
+            for z in zones
+        ],
+    }
+
+
+@app.post("/analyst/sniper")
+async def run_analyst_sniper():
+    """IA analisa oportunidades sniper e gera plano de entrada cirúrgico."""
+    opps  = await compute_sniper_opportunities(engine)
+    snaps = {sym: engine.to_dict(snap) for sym, snap in engine.get_all_snapshots().items()}
+    opps_dicts = [
+        {
+            "symbol":           o.symbol,
+            "side":             o.side,
+            "confluence_score": o.confluence_score,
+            "confidence":       o.confidence,
+            "entry_price":      o.entry_price,
+            "signals":          o.signals,
+        }
+        for o in opps
+    ]
+    analysis = await run_sniper_analysis(opps_dicts, snaps)
+    return {
+        "analysis_type":  analysis.analysis_type,
+        "generated_at":   analysis.generated_at,
+        "model":          analysis.model,
+        "ai_enabled":     _has_ai(),
+        "full_text":      analysis.full_text,
+        "summary":        analysis.summary,
+        "opportunities_analyzed": len(opps),
+    }
+
+
+@app.post("/analyst/mass-entry")
+async def run_analyst_mass_entry():
+    """IA aprova / ajusta zonas de entrada em massa e alerta sobre correlação."""
+    opps  = await compute_sniper_opportunities(engine)
+    zones = await compute_all_mass_entry_zones(engine, opps)
+    snaps = {sym: engine.to_dict(snap) for sym, snap in engine.get_all_snapshots().items()}
+
+    zones_dicts = [
+        {
+            "symbol":           z.symbol,
+            "side":             z.side,
+            "strategy":         z.strategy,
+            "total_confluence": z.total_confluence,
+            "levels":           z.levels,
+        }
+        for z in zones
+    ]
+
+    # Contexto macro simples (BTC)
+    btc_snap = snaps.get("BTC-USDT", {})
+    market_ctx = {
+        "btc_regime":  btc_snap.get("btc_regime", "UNKNOWN"),
+        "btc_vol_pct": abs(btc_snap.get("price_change_pct", 0)),
+    }
+
+    analysis = await run_mass_entry_scan(zones_dicts, market_ctx)
+    return {
+        "analysis_type":   analysis.analysis_type,
+        "generated_at":    analysis.generated_at,
+        "model":           analysis.model,
+        "ai_enabled":      _has_ai(),
+        "full_text":       analysis.full_text,
+        "zones_analyzed":  len(zones),
     }
 
 
@@ -1320,7 +1490,8 @@ async def evaluate_edge_endpoint(body: dict):
     if "symbol" not in body:
         raise HTTPException(400, "Required field: symbol")
     try:
-        return await asyncio.wait_for(evaluate_edge_gate(body), timeout=_EDGE_EVALUATE_TIMEOUT_SECONDS)
+        result = await asyncio.wait_for(evaluate_edge_gate(body), timeout=_EDGE_EVALUATE_TIMEOUT_SECONDS)
+        return _sanitize_floats(result)
     except asyncio.TimeoutError:
         log.exception("edge evaluate timeout")
         return _quant_fail_closed(
@@ -1449,14 +1620,14 @@ async def rank_cycle_candidates(body: dict):
         reverse=True,
     )
 
-    return {
+    return _sanitize_floats({
         "ranked": ranked,
         "blocked": blocked_results,
         "totalCandidates": len(results),
         "allowed": len(allowed_results),
         "blockedCount": len(blocked_results),
         "mode": "judge-coach-dual-layer-v1",
-    }
+    })
 
 
 @app.get("/regime-playbook/status")

@@ -35,6 +35,7 @@ from core.movement_sniper import evaluate_sniper_window, build_movement_features
 from core.signal_learning import finalize_due_signal_outcomes, score_signal_context
 from core.shadow_model import restore_shadow_model, shadow_model_status, train_shadow_model
 from core.shadow_sampler import reconcile_shadow_sampler_status, shadow_sampler_status, sample_shadow_signals_once
+from core.offline_learner import perform_daily_recalibration, offline_learner_status, query_purified_samples_count
 from core.training_serving_skew import skew_status
 from core.exit_intelligence import evaluate_exit
 from core.exit_learning import record_exit_outcome as _record_exit_outcome, record_exit_evaluation, get_exit_stats
@@ -92,8 +93,10 @@ job_supervisor = JobSupervisor(
 _RETENTION_MAINTENANCE_SECONDS = float(
     os.environ.get("RETENTION_MAINTENANCE_SECONDS", "3600")
 )
+_VACUUM_INTERVAL_SECONDS = float(os.environ.get("VACUUM_INTERVAL_SECONDS", str(7 * 24 * 3600)))
 _last_model_training_attempt_samples = 0
 _last_retention_maintenance_at = 0.0
+_last_vacuum_at = 0.0
 _training_lock = asyncio.Lock()
 _training_task: asyncio.Task | None = None
 _training_status: dict[str, Any] = {
@@ -400,8 +403,17 @@ def cache_response(ttl_seconds: int = None):
 
 # ========== LIFESPAN ==========
 
+async def _background_vacuum():
+    """VACUUM SQLite em background — libera espaço físico após cleanup_retention."""
+    try:
+        await kb.vacuum_db()
+        log.info("DB VACUUM completed — espaço físico liberado")
+    except Exception as exc:
+        log.warning("DB VACUUM failed (non-critical): %s", exc)
+
+
 async def _run_model_maintenance_once():
-    global _last_model_training_attempt_samples, _last_retention_maintenance_at
+    global _last_model_training_attempt_samples, _last_retention_maintenance_at, _last_vacuum_at
 
     await restore_shadow_model()
     summary = await kb.get_signal_training_summary(decision_group=None, source_type=None)
@@ -430,8 +442,14 @@ async def _run_model_maintenance_once():
     if time.time() - _last_retention_maintenance_at >= _RETENTION_MAINTENANCE_SECONDS:
         deleted = await kb.cleanup_retention()
         _last_retention_maintenance_at = time.time()
+        total_deleted = sum(deleted.values())
         if any(deleted.values()):
-            log.info("Retention cleanup completed: %s", deleted)
+            log.info("Retention cleanup completed: %s (total=%d rows)", deleted, total_deleted)
+        # VACUUM: roda em background se houve deleção significativa E intervalo decorrido
+        # Intervalo padrão: 7 dias (VACUUM_INTERVAL_SECONDS). Não bloqueia endpoint algum.
+        if total_deleted >= 50 and time.time() - _last_vacuum_at >= _VACUUM_INTERVAL_SECONDS:
+            _last_vacuum_at = time.time()
+            asyncio.create_task(_background_vacuum())
 
 
 async def _run_signal_finalizer_once():
@@ -533,6 +551,27 @@ async def _initialize_runtime_services():
         enabled=os.environ.get("SHADOW_SAMPLER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
         run_immediately=True,
     )
+
+    # Offline Learner: pipeline de re-treinamento autônomo 24h.
+    # Lê trigger_outcomes.jsonl escrito pelo Node.js, reconcilia outcomes no
+    # banco do QB, e dispara train_shadow_model() quando há amostras suficientes.
+    _offline_learner_interval = int(float(os.environ.get("OFFLINE_LEARNER_INTERVAL_SECONDS", str(24 * 3600))))
+    _offline_learner_enabled = os.environ.get("OFFLINE_LEARNER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+    job_supervisor.register(
+        "offline_learner",
+        perform_daily_recalibration,
+        interval_seconds=max(3600, _offline_learner_interval),
+        timeout_seconds=int(float(os.environ.get("OFFLINE_LEARNER_JOB_TIMEOUT_SECONDS", "120"))),
+        priority="low",
+        enabled=_offline_learner_enabled,
+        run_immediately=False,
+    )
+    log.info(
+        "Offline learner registered (interval=%.0fh enabled=%s)",
+        _offline_learner_interval / 3600,
+        _offline_learner_enabled,
+    )
+
     job_supervisor.start()
     log.info(f"Runtime job supervisor started with {len(job_supervisor.jobs)} jobs")
 
@@ -1756,6 +1795,116 @@ async def run_shadow_sampler_once_endpoint():
         "ok": True,
         "sampler": shadow_sampler_status(),
         **result,
+    }
+
+
+@app.get("/signals/shadow-sampler/intelligence")
+async def shadow_sampler_intelligence_endpoint():
+    """
+    Inteligência sniper filtrada — apenas sinais ARM_TRIGGER com score >= threshold.
+
+    Retorna:
+      - intelligenceAnalyses: últimos sinais que passaram no filtro de qualidade
+      - sniperStats: taxa de aprovação/filtro do ciclo atual
+      - offlineLearner: status do pipeline de re-treinamento autônomo 24h
+    """
+    sampler = shadow_sampler_status()
+    learner = offline_learner_status()
+    sniper_filtered = int(sampler.get("sniperFiltered") or 0)
+    sniper_passed = int(sampler.get("sniperPassed") or 0)
+    total = sniper_filtered + sniper_passed
+    return {
+        "intelligenceAnalyses": sampler.get("lastIntelligenceAnalyses") or [],
+        "sniperStats": {
+            "passed": sniper_passed,
+            "filtered": sniper_filtered,
+            "total": total,
+            "passRate": round(sniper_passed / total, 4) if total > 0 else None,
+            "minScore": float(os.environ.get("SHADOW_SAMPLER_MIN_SCORE", "0.55")),
+            "armOnly": os.environ.get("SHADOW_SAMPLER_ARM_ONLY", "true").strip().lower() not in {"0", "false", "no", "off"},
+        },
+        "offlineLearner": {
+            "enabled": os.environ.get("OFFLINE_LEARNER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
+            "cycles": learner.get("cycles"),
+            "lastRunAt": learner.get("lastRunAt"),
+            "lastError": learner.get("lastError"),
+            "outcomesRecorded": learner.get("outcomesRecorded"),
+            "outcomesSkipped": learner.get("outcomesSkipped"),
+            "trainingsTriggered": learner.get("trainingsTriggered"),
+            "lastTrainingResult": learner.get("lastTrainingResult"),
+            "checkpointTs": learner.get("checkpointTs"),
+            "intervalHours": round(
+                max(3600, int(float(os.environ.get("OFFLINE_LEARNER_INTERVAL_SECONDS", str(24 * 3600))))) / 3600,
+                1,
+            ),
+        },
+    }
+
+
+@app.post("/offline-learner/run")
+async def run_offline_learner_endpoint():
+    """Dispara manualmente um ciclo do offline learner (útil para teste/debug)."""
+    result = await perform_daily_recalibration()
+    return {"ok": True, **result}
+
+
+@app.get("/offline-learner/status")
+async def offline_learner_status_endpoint():
+    """Status completo do pipeline de re-treinamento autônomo."""
+    return offline_learner_status()
+
+
+@app.get("/sniper/telemetry/stats")
+async def sniper_telemetry_stats_endpoint():
+    """
+    Elevação 3: Telemetria consolidada do Sniper Real.
+
+    Retorna visão unificada do ecossistema de qualidade sniper:
+      - purifiedSamplesCount: amostras puras do banco (signal_outcomes JOIN trade_outcomes)
+      - sniperGridValidatedCount: ARM_TRIGGER_GRID que passaram pelo quality gate
+      - activeModelInfo: estado atual do shadow model (accuracy, features, artifacts)
+      - offlineLearner: ciclos, outcomes processados, treinos disparados
+      - jobSupervisorMetrics: estado do job "offline_learner" no supervisor de 24h
+    """
+    purified_count = await query_purified_samples_count()
+    model_meta = shadow_model_status()
+    learner = offline_learner_status()
+    sup_status = job_supervisor.status()
+    learner_job = sup_status.get("jobs", {}).get("offline_learner", {})
+
+    return {
+        "status": "OPERATIONAL",
+        "timestamp": time.time(),
+        "telemetry": {
+            "purifiedSamplesCount": purified_count,
+            "sniperGridValidatedCount": int(learner.get("sniperGridValidatedCount") or 0),
+            "activeModelInfo": model_meta,
+            "databaseEngine": "SQLite (knowledge.db)",
+            "dbPath": str(kb.DB_PATH),
+        },
+        "offlineLearner": {
+            "enabled": learner.get("enabled"),
+            "cycles": learner.get("cycles"),
+            "outcomesRecorded": learner.get("outcomesRecorded"),
+            "outcomesSkipped": learner.get("outcomesSkipped"),
+            "outcomesAlreadyProcessed": learner.get("outcomesAlreadyProcessed"),
+            "trainingsTriggered": learner.get("trainingsTriggered"),
+            "lastRunAt": learner.get("lastRunAt"),
+            "lastError": learner.get("lastError"),
+            "lastTrainingResult": learner.get("lastTrainingResult"),
+            "checkpointTs": learner.get("checkpointTs"),
+        },
+        "jobSupervisorMetrics": {
+            "name": "offline_learner",
+            "running": learner_job.get("running", False),
+            "totalRuns": learner_job.get("runs", 0),
+            "consecutiveFailures": learner_job.get("consecutiveFailures", 0),
+            "lastStartedAt": learner_job.get("lastStartedAt", 0.0),
+            "lastFinishedAt": learner_job.get("lastFinishedAt", 0.0),
+            "lastDurationMs": learner_job.get("lastDurationMs", 0.0),
+            "intervalSeconds": learner_job.get("intervalSeconds"),
+            "priority": learner_job.get("priority"),
+        },
     }
 
 

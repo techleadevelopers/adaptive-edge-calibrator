@@ -9,10 +9,115 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from core.history_logger import log_arm_trigger_snapshot
 from core.movement_sniper import MovementFeatures, evaluate_sniper_window
+
+# ── System 2: Sector Cluster map (espelha sectorMap.ts no Node.js) ───────────
+_SECTOR_CLUSTERS: dict[str, str] = {
+    "BTC-USDT":     "LAYER_1",
+    "ETH-USDT":     "LAYER_1",
+    "SOL-USDT":     "LAYER_1",
+    "POL-USDT":     "LAYER_1",
+    "NEAR-USDT":    "AI_INFRA",
+    "VVV-USDT":     "DEFI",
+    "HYPE-USDT":    "DEFI",
+    "TRUMP-USDT":   "MEME",
+    "MELANIA-USDT": "MEME",
+    "BEAT-USDT":    "MEME",
+}
+
+
+def _sector_cluster(sym: str) -> str:
+    return _SECTOR_CLUSTERS.get(sym, "OTHER")
+
+
+def build_sniper_tail_grid(
+    current_price: float,
+    side: str,
+    base_target_usdt: float,
+    atr_pct: float = 0.0,
+) -> list[dict]:
+    """
+    Gera a escada de gatilhos Tail Hunter para caça de pavios (espetos extremos).
+
+    Geometria ancorada no preço atual de mercado — não no ponto de exaustão da
+    microframe — para que os drops/pumps sejam absolutos em relação ao preço real.
+
+    LONG : entra em quedas de 10%, 11%, 12% — 3 níveis, pirâmide 20/30/50%
+    SHORT: entra em altas de 20%, 21%, 22%, 24% — 4 níveis, pesos 15/25/30/30%
+
+    TP dinâmico: base_target_usdt / trigger_price × 100
+      → mesmo scaling do single-trigger; clamped 0.08%–3.00% (production-safe
+        para qualquer faixa de preço, de $0.0001 a $200k por unidade).
+      → aplica floor ATR se disponível (min 40% do ATR para ser atingível).
+    SL rigoroso: 2× TP (relação 2:1 perda:ganho na margem isolada).
+    """
+    if current_price <= 0 or base_target_usdt <= 0:
+        return []
+
+    grid_layers: list[dict] = []
+
+    def _level_geometry(trigger_p: float) -> tuple[float, float]:
+        """Retorna (tp_pct, sl_pct) clamped — idêntico ao single-trigger scaler."""
+        raw_tp = (base_target_usdt / trigger_p) * 100
+        if atr_pct > 0:
+            raw_tp = max(raw_tp, atr_pct * 0.40)  # mínimo 40% do ATR
+        tp = max(0.08, min(3.00, raw_tp))
+        sl = tp * 2.0
+        return tp, sl
+
+    if side == "LONG":
+        drop_percentages   = [0.10, 0.11, 0.12]
+        allocation_weights = [0.20, 0.30, 0.50]
+        for idx, drop in enumerate(drop_percentages):
+            trigger_p = current_price * (1.0 - drop)
+            tp_pct, sl_pct = _level_geometry(trigger_p)
+            grid_layers.append({
+                "level":            idx + 1,
+                "side":             "LONG",
+                "triggerPrice":     round(trigger_p, 6),
+                "targetPrice":      round(trigger_p * (1.0 + tp_pct / 100), 6),
+                "stopPrice":        round(trigger_p * (1.0 - sl_pct / 100), 6),
+                "allocationFactor": allocation_weights[idx],
+            })
+
+    elif side == "SHORT":
+        pump_percentages   = [0.20, 0.21, 0.22, 0.24]
+        allocation_weights = [0.15, 0.25, 0.30, 0.30]
+        for idx, pump in enumerate(pump_percentages):
+            trigger_p = current_price * (1.0 + pump)
+            tp_pct, sl_pct = _level_geometry(trigger_p)
+            grid_layers.append({
+                "level":            idx + 1,
+                "side":             "SHORT",
+                "triggerPrice":     round(trigger_p, 6),
+                "targetPrice":      round(trigger_p * (1.0 - tp_pct / 100), 6),
+                "stopPrice":        round(trigger_p * (1.0 + sl_pct / 100), 6),
+                "allocationFactor": allocation_weights[idx],
+            })
+
+    return grid_layers
+
+
+def _compute_recommended_leverage(atr_pct_fraction: float) -> int:
+    """ATR-adaptive leverage: volatilidade alta → alavancagem menor.
+
+    Formula: 0.10 / atr_pct_fraction
+      ATR = 0.5% (0.005) → 20x  (default calibrado)
+      ATR = 1.0% (0.010) → 10x
+      ATR = 2.0% (0.020) → 5x
+      ATR = 0.2% (0.002) → 50x (cap)
+    """
+    if atr_pct_fraction <= 0:
+        return 20
+    raw = 0.10 / atr_pct_fraction
+    return max(5, min(50, round(raw)))
+
+
 from core import knowledge_base as kb
 from core.recommendation import recommend_entry
 from core.async_utils import run_edge_blocking
+from core.candle_regime import analyze_microframe_regime
 from core.signal_learning import (
     build_context_key,
     finalize_due_signal_outcomes,
@@ -660,6 +765,25 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
         except (TypeError, ValueError):
             pass
 
+    # Fix 4 (Early Expiry Fast-Path): shortcircuit ANTES de qualquer I/O de mercado.
+    # O judge_entry verificaria o mesmo em check #1, mas só após centenas de ms de
+    # computação cara: evaluate_sniper_window, feature extraction, ML inference, etc.
+    # intelligence_only não sofre shortcircuit pois serve para análise estática
+    # de contexto onde a expiração não é relevante para o caller.
+    if signal_expired and not intelligence_only:
+        return {
+            "decision": "WAIT",
+            "blocks": ["SIGNAL_EXPIRED: signal expired before pipeline evaluation"],
+            "mode": "expired",
+            "symbol": symbol,
+            "positionSide": position_side,
+            "expiresAt": expires_at_ms,
+            "signalId": request_signal_id,
+            "executionPriority": 0.0,
+            "aggressiveScore": 0.0,
+            "learningScore": 0.0,
+        }
+
     # ── Sentiment context ────────────────────────────────────────────────────
     sentiment_ctx = payload.get("sentimentContext") or {}
     sentiment_direction = str(sentiment_ctx.get("direction", "NEUTRAL")).upper()
@@ -1051,7 +1175,70 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
                 "COST_EDGE_REJECT: target does not clear execution costs + noise margin"
             )
 
-    all_blocks = judge_result["blocks"] + high_sample_blocks + risk_geometry_blocks + ml_economic_blocks + extra_blocks
+    # ── Universal Filters: aplicados a TODOS os perfis de risco ──────────────
+    # Estes bloqueios independem do risco_profile. São filtros de microestrutura
+    # e timing macro que protegem a geometria do gatilho em qualquer contexto.
+    universal_blocks: list[str] = []
+
+    # ── Feature 2: ATR Shadow Filter — "Volatilidade Fantasma" ────────────────
+    # Detecta moedas de baixa liquidez que se movem por gaps (pulos de preço)
+    # em vez de flow contínuo. Isso quebra a matemática do triggerPrice.
+    # Critério: spread > 50% do range ATR E volume muito abaixo da média.
+    _alt_atr_pct_v = _num(alt_features.get("atr_pct"), 0.0)
+    _alt_volume_ratio_v = _num(alt_features.get("volume_ratio"), 1.0)
+    if _alt_atr_pct_v > 0 and spread_bps > 0:
+        # atr_pct como fração (ex: 0.005 = 0.5%) → em bps: * 10_000
+        _atr_bps = _alt_atr_pct_v * 10_000
+        _spread_vs_atr = spread_bps / _atr_bps if _atr_bps > 0 else 0
+        if _spread_vs_atr > 0.50 and _alt_volume_ratio_v < 0.30:
+            universal_blocks.append(
+                f"ATR_SHADOW_UNTRADABLE: spread {spread_bps:.1f}bps vs ATR "
+                f"{_atr_bps:.1f}bps (ratio {_spread_vs_atr:.2f}x), "
+                f"vol_ratio {_alt_volume_ratio_v:.2f} — ghost volatility / gappy price action"
+            )
+
+    # ── Feature 4: Funding Rate Front-Running ─────────────────────────────────
+    # Se faltam < FUNDING_BLOCK_WINDOW_SEC para o próximo funding E a taxa é
+    # adversária à direção do trade → WAIT.
+    # Melhor ficar de fora 3 minutos do que começar o scalp devendo taxa macro.
+    _funding_rate_val = _num(alt_features.get("funding_rate"), 0.0)
+    _next_funding_ms = _num(alt_features.get("next_funding_time_ms"), 0.0)
+    if _next_funding_ms > 0:
+        _time_to_funding_s = (_next_funding_ms - time.time() * 1000) / 1000
+        _funding_block_window_s = float(os.environ.get("FUNDING_BLOCK_WINDOW_SEC", "180"))
+        if 0 < _time_to_funding_s < _funding_block_window_s:
+            # Taxa adversária: positiva + LONG (paga funding) ou negativa + SHORT (paga funding)
+            _funding_adversarial = (
+                (position_side == "LONG" and _funding_rate_val > 0.0001) or
+                (position_side == "SHORT" and _funding_rate_val < -0.0001)
+            )
+            if _funding_adversarial:
+                universal_blocks.append(
+                    f"FUNDING_WINDOW_REJECT: {_time_to_funding_s:.0f}s para próximo funding "
+                    f"(rate {_funding_rate_val:.4%}, side {position_side}) — "
+                    f"janela de {_funding_block_window_s:.0f}s ativa"
+                )
+
+    # ── System 1: Timestamp Matcher (Clock Precision Sync) ────────────────────
+    # Libera o cálculo do gatilho APENAS se os dados dos 3 timeframes estiverem
+    # sincronizados. Dados com atraso > DATA_SYNC_MAX_STALE_S (padrão 0.5s)
+    # indicam buffer não normalizado — a geometria calculada nasceria errada
+    # porque o preço real já andou desde a última vela capturada.
+    _data_sync_threshold_s = float(os.environ.get("DATA_SYNC_MAX_STALE_S", "0.5"))
+    _frame_stales = {
+        "alt1m":  _num((data_quality.get("alt1m")  or {}).get("staleSeconds"), 0.0),
+        "alt5m":  _num((data_quality.get("alt5m")  or {}).get("staleSeconds"), 0.0),
+        "alt15m": _num((data_quality.get("alt15m") or {}).get("staleSeconds"), 0.0),
+    }
+    _worst_frame_name = max(_frame_stales, key=lambda k: _frame_stales[k])
+    _worst_stale_s = _frame_stales[_worst_frame_name]
+    if _worst_stale_s > _data_sync_threshold_s:
+        universal_blocks.append(
+            f"DATA_SYNC_REJECT: {_worst_frame_name} staleSeconds={_worst_stale_s:.3f}s "
+            f"> threshold={_data_sync_threshold_s:.1f}s — aguardando normalização do buffer de dados"
+        )
+
+    all_blocks = judge_result["blocks"] + high_sample_blocks + risk_geometry_blocks + ml_economic_blocks + extra_blocks + universal_blocks
     allow = len(all_blocks) == 0
 
     # ── LAYER 2: Coach Ranker — scoring, soft penalties, ranking ────────────
@@ -1101,7 +1288,145 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             setup_type=(regime_playbook.get("allowedSetups") or [None])[0],
         )
 
-    return {
+    # ── Microframe Intelligence — Exhaustion Trigger ──────────────────────────
+    # Análise 1m/5m/15m para detecção de exaustão de microestrutura.
+    # Roda em paralelo com best-effort timeout (3.5s) para não atrasar o gate.
+    # executionType = "TRIGGER_LIMIT" → bot coloca LIMIT ao invés de MARKET.
+    _microframe: dict[str, Any] = {
+        "executionType": "MARKET",
+        "triggerPrice": None,
+        "triggerExpirationSeconds": int(os.environ.get("TRIGGER_EXPIRATION_SECONDS", "45")),
+    }
+    try:
+        _microframe = await asyncio.wait_for(
+            analyze_microframe_regime(symbol),
+            timeout=3.5,
+        )
+    except Exception:
+        pass
+
+    # ── Geometria Completa do Gatilho (Contrato de Arquitetura) ────────────────
+    # O Quant Brain é a ÚNICA entidade responsável por toda a geometria da ordem.
+    # O backend Node.js é PROIBIDO de recalcular triggerPrice, targetPrice,
+    # stopPrice ou expirationSeconds. Ele apenas valida risco e executa.
+    #
+    # Feature 5: Dynamic Target Scaler
+    # Converte $BASE_TARGET_USDT (padrão $0.50) para percentual geométrico dinâmico
+    # baseado no preço real do ativo. Mantém assimetria 2:1 (TP:SL) rigorosa
+    # independente de o ativo custar $2.00 ou $150.00.
+    _base_target_usdt = float(os.environ.get("BASE_TARGET_USDT", "0.50"))
+    _ref_price_for_scale = float(payload.get("referencePrice") or 0)
+    # Fallback: usar triggerPrice se referencePrice indisponível
+    if _ref_price_for_scale <= 0:
+        _raw_for_scale = _microframe.get("triggerPrice")
+        if _raw_for_scale:
+            _ref_price_for_scale = float(_raw_for_scale)
+
+    if _ref_price_for_scale > 0:
+        # Percentual dinâmico: $0.50 / preço_atual → % de movimento necessário
+        _dynamic_tp_pct = (_base_target_usdt / _ref_price_for_scale) * 100
+        # Scaling baseado em ATR: alvo mínimo = 40% do ATR para ser atingível
+        _atr_pct_for_scale = _num(alt_features.get("atr_pct"), 0.0)
+        if _atr_pct_for_scale > 0:
+            _dynamic_tp_pct = max(_dynamic_tp_pct, _atr_pct_for_scale * 0.40)
+        # Clamp: 0.08% mínimo (protege margens), 3.0% máximo (não ser ganancioso)
+        _tp_pct = max(0.08, min(3.00, _dynamic_tp_pct))
+        # Stop = TP / 2 → 2:1 reward/risk matemático rigoroso
+        _sl_pct = max(0.04, _tp_pct / 2.0)
+    else:
+        # Fallback estático ao regime playbook se preço indisponível
+        _tp_pct = float(regime_playbook.get("recommendedTpPct") or configured_target_pct or 0.22)
+        _sl_pct = float(regime_playbook.get("recommendedSlPct") or stop_move_pct or 0.55)
+    _raw_trigger = _microframe.get("triggerPrice")
+    _raw_expiration = int(_microframe.get("triggerExpirationSeconds") or 30)
+
+    _trigger_px: float | None = float(_raw_trigger) if _raw_trigger and float(_raw_trigger) > 0 else None
+    _target_px: float | None = None
+    _stop_px: float | None = None
+    _grid_levels: list[dict] = []
+
+    _ENABLE_GRID_SNIPER = os.environ.get("ENABLE_GRID_SNIPER", "false").strip().lower() in ("1", "true", "yes")
+
+    if allow and _trigger_px and _microframe.get("executionType") == "TRIGGER_LIMIT":
+        # ARM_TRIGGER via ordem limite — geometria ancorada no ponto exato de exaustão
+        if position_side == "LONG":
+            _target_px = round(_trigger_px * (1 + _tp_pct / 100), 6)
+            _stop_px   = round(_trigger_px * (1 - _sl_pct / 100), 6)
+        else:
+            _target_px = round(_trigger_px * (1 - _tp_pct / 100), 6)
+            _stop_px   = round(_trigger_px * (1 + _sl_pct / 100), 6)
+        _decision = "ARM_TRIGGER"
+
+        # ── Tail Hunter upgrade (produção real) ────────────────────────────────
+        # Condição: ENABLE_GRID_SNIPER=true + score de exaustão microframe ≥ 0.65
+        # Âncora: referencePrice (preço de mercado live) — drops/pumps absolutos,
+        # independentes da microframe. TP dinâmico por base_target_usdt.
+        _exec_priority = float(coaching["executionPriority"])
+        if _ENABLE_GRID_SNIPER and _exec_priority >= 0.65 and _ref_price_for_scale > 0:
+            _grid_levels = build_sniper_tail_grid(
+                current_price=_ref_price_for_scale,
+                side=position_side,
+                base_target_usdt=_base_target_usdt,
+                atr_pct=_atr_pct_for_scale,
+            )
+            if _grid_levels:
+                _decision = "ARM_TRIGGER_GRID"
+                # ── Elevação 1: Marcar sinal no DB como SNIPER_QUALITY_VALIDATED ──
+                # Sobrescreve o setup_type do audit para identificar amostras puras
+                # de ARM_TRIGGER_GRID no treino offline (signal_outcomes.setup_type).
+                if not intelligence_only:
+                    try:
+                        await kb.update_signal_decision_audit(
+                            memory_signal_id,
+                            allowed=True,
+                            reject_reasons=[],
+                            setup_type="SNIPER_GRID_VALIDATED",
+                        )
+                    except Exception:
+                        pass  # best-effort — não bloqueia a resposta
+    elif allow:
+        # ARM_TRIGGER com execução a mercado — geometria ancorada no referencePrice
+        _ref_px = float(payload.get("referencePrice") or 0)
+        if _ref_px > 0:
+            if position_side == "LONG":
+                _target_px = round(_ref_px * (1 + _tp_pct / 100), 6)
+                _stop_px   = round(_ref_px * (1 - _sl_pct / 100), 6)
+            else:
+                _target_px = round(_ref_px * (1 - _tp_pct / 100), 6)
+                _stop_px   = round(_ref_px * (1 + _sl_pct / 100), 6)
+        _trigger_px = None  # MARKET — sem triggerPrice
+        _decision = "ARM_TRIGGER"
+    else:
+        _trigger_px = None
+        _decision = "WAIT"
+
+    _edge_score = round(float(coaching["executionPriority"]) * 10, 2)
+    _confidence = round(ml_calibrated_prob, 4) if ml_calibrated_prob is not None else round(hit_probability, 4)
+    _kelly_fraction = float(optimal_size.get("kelly_fraction", 0.0))
+    # EV como fração do nocional (não em USDT absoluto) — comparável entre tamanhos
+    _ev_pct = round(net_ev_usdt / max(0.01, notional), 6)
+
+    # ── Compute applied filters (Feature 2 & 4 pass/fail tags) ──────────────
+    _atr_shadow_passed = not any("ATR_SHADOW_UNTRADABLE" in b for b in universal_blocks)
+    _funding_window_passed = not any("FUNDING_WINDOW_REJECT" in b for b in universal_blocks)
+    _data_sync_passed = not any("DATA_SYNC_REJECT" in b for b in universal_blocks)
+    _applied_filters: list[str] = []
+    if _atr_shadow_passed:
+        _applied_filters.append("ATR_SHADOW_PASSED")
+    else:
+        _applied_filters.append("ATR_SHADOW_FAILED")
+    if _funding_window_passed:
+        _applied_filters.append("FUNDING_WINDOW_PASSED")
+    else:
+        _applied_filters.append("FUNDING_WINDOW_FAILED")
+    if _data_sync_passed:
+        _applied_filters.append("DATA_SYNC_PASSED")
+    else:
+        _applied_filters.append("DATA_SYNC_FAILED")
+
+    _recommended_leverage = _compute_recommended_leverage(_alt_atr_pct_v)
+
+    _edge_response = {
         "allow": allow,
         "available": True,
         "gateRejects": all_blocks,
@@ -1190,4 +1515,68 @@ async def evaluate_edge_gate(payload: dict[str, Any]) -> dict[str, Any]:
             "adjustedStopPct": adjusted_stop,
         },
         "mode": "expired" if signal_expired else "judge-coach-dual-layer-v1",
+        "features": payload.get("features") or {},
+        # Exhaustion Trigger fields (microframe 1m/5m/15m intelligence)
+        "executionType": _microframe.get("executionType", "MARKET"),
+        "triggerPrice": _microframe.get("triggerPrice"),
+        "triggerExpirationSeconds": _microframe.get("triggerExpirationSeconds", 45),
+        "microframeRegime": _microframe,
+        # ── Contrato de Geometria Completa (campos planos — backward compat) ──
+        "decision": _decision,
+        "targetPrice": _target_px,
+        "stopPrice": _stop_px,
+        "expirationSeconds": _raw_expiration if _decision == "ARM_TRIGGER" else None,
+        "edgeScore": _edge_score,
+        "confidence": _confidence,
+        "expectedValue": _ev_pct,
+        "kellyFraction": round(_kelly_fraction, 6),
+        # ── System 2: Sector cluster para cascade filter no Node.js ────────────
+        "sectorCluster": _sector_cluster(symbol),
+        # ── System 4: Execution metrics — contrato padrão-ouro v4 ────────────
+        # Node.js consome estes campos para gate de tick density, alavancagem
+        # dinâmica e validação de geometria (calculatedTpPct / calculatedSlPct).
+        "executionMetrics": {
+            "recommendedLeverage": _recommended_leverage,
+            "minTickDensity1m": int((data_quality.get("alt1m") or {}).get("samples", 0)),
+            "maxSpreadAllowed": 0.0002,
+            # ── Campos adicionados pelo relatório técnico (Dynamic Target Scaler)
+            "baseTargetUsdt": _base_target_usdt,
+            "calculatedTpPct": round(_tp_pct, 6),
+            "calculatedSlPct": round(_sl_pct, 6),
+            "appliedFilters": _applied_filters,
+            # ── Grid Sniper — presentes apenas quando decision == ARM_TRIGGER_GRID
+            "gridStrategy": "TAIL_HUNTER" if _decision == "ARM_TRIGGER_GRID" else None,
+            "expirationSeconds": _raw_expiration,
+        },
+        # ── Grid Sniper: níveis da escada (null para decisões não-grid) ──────────
+        "grid": _grid_levels if _decision == "ARM_TRIGGER_GRID" else None,
+        # ── Objetos estruturados do relatório técnico ─────────────────────────
+        # Complementam os campos planos (backward compat mantida).
+        # BatchTriggerOrchestrator consome `geometry` e `probabilityModel`.
+        "metadata": {
+            "signalId": request_signal_id,
+            "symbol": symbol,
+            "timestamp": int(time.time() * 1000),
+            "sectorCluster": _sector_cluster(symbol),
+            # Elevação 1: flag de qualidade sniper — True apenas quando o sinal
+            # passou pelo filtro de score ≥ 0.65 E gerou escada de gatilhos.
+            "sniperQualityValidated": _decision == "ARM_TRIGGER_GRID",
+        },
+        "geometry": {
+            "side": position_side,
+            "triggerPrice": _trigger_px,
+            "targetPrice": _target_px,
+            "stopPrice": _stop_px,
+            "expirationSeconds": _raw_expiration if _decision == "ARM_TRIGGER" else None,
+        },
+        "probabilityModel": {
+            "confidence": _confidence,
+            "edgeScore": _edge_score,
+            "expectedValue": _ev_pct,
+            "kellyFraction": round(_kelly_fraction, 6),
+        },
     }
+    # Gap 1 — Quality filter: persiste snapshots puros de ARM_TRIGGER para treino offline.
+    # Só grava se decision == ARM_TRIGGER e geometria completa — dado limpo garantido.
+    log_arm_trigger_snapshot(_edge_response)
+    return _edge_response

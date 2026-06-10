@@ -465,8 +465,12 @@ async def _run_model_maintenance_once():
     if time.time() - _last_retention_maintenance_at >= _RETENTION_MAINTENANCE_SECONDS:
         deleted = await kb.cleanup_retention()
         _last_retention_maintenance_at = time.time()
-        total_deleted = sum(deleted.values())
-        if any(deleted.values()):
+        total_deleted = sum(
+            int(value.get("deleted", 0))
+            for key, value in deleted.items()
+            if isinstance(value, dict) and key != "_aggregates"
+        )
+        if total_deleted > 0:
             log.info("Retention cleanup completed: %s (total=%d rows)", deleted, total_deleted)
         # VACUUM: roda em background se houve deleção significativa E intervalo decorrido
         # Intervalo padrão: 7 dias (VACUUM_INTERVAL_SECONDS). Não bloqueia endpoint algum.
@@ -2275,6 +2279,12 @@ async def health():
             3,
         ),
     }
+
+
+@app.get("/health/storage")
+async def storage_health():
+    """Storage guardrail: table growth, cold archive status, and retention risk."""
+    return await kb.get_storage_health()
 
 
 @app.get("/")

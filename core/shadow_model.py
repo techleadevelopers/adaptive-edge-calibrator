@@ -154,8 +154,8 @@ def _feature_dict(row: dict[str, Any]) -> dict[str, Any]:
     result["rsi_extreme"] = 1 if result.get("alt_rsi", 50) > 75 or result.get("alt_rsi", 50) < 25 else 0
     result["spread_penalty"] = min(1.0, result.get("alt_spread_bps", 0) / 20)
     result["regime_aligned"] = 1 if (
-        (row.get("side", "") == "LONG" and result["btc_candle_bias"] == "LONG") or
-        (row.get("side", "") == "SHORT" and result["btc_candle_bias"] == "SHORT")
+        (row.get("side", "") == "SHORT" and result["btc_candle_bias"] == "LONG") or
+        (row.get("side", "") == "LONG" and result["btc_candle_bias"] == "SHORT")
     ) else 0
 
     # Features de geometria do gatilho — aprendizado de distância ótima

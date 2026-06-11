@@ -603,21 +603,21 @@ def evaluate_sniper_window(
 
     # Impulsos com alta qualidade
     elif alt.movement_state == "IMPULSE_UP_HIGH_QUALITY" and btc_state["state"] == "BTC_IMPULSE_UP":
-        decision = "ALLOW_LONG" if best_probability >= allow_threshold else "WAIT"
-        reasons.extend(["btc_impulse_up", "alt_impulse_up_high_quality"])
+        decision = "ALLOW_SHORT" if best_probability >= allow_threshold else "WAIT"
+        reasons.extend(["btc_impulse_up", "alt_impulse_up_high_quality", "contrarian_short_after_pump"])
 
     elif alt.movement_state == "IMPULSE_DOWN_HIGH_QUALITY" and btc_state["state"] == "BTC_IMPULSE_DOWN":
-        decision = "ALLOW_SHORT" if best_probability >= allow_threshold else "WAIT"
-        reasons.extend(["btc_impulse_down", "alt_impulse_down_high_quality"])
+        decision = "ALLOW_LONG" if best_probability >= allow_threshold else "WAIT"
+        reasons.extend(["btc_impulse_down", "alt_impulse_down_high_quality", "contrarian_long_after_dump"])
 
     # Impulsos padrão
     elif alt.movement_state == "IMPULSE_UP" and btc_state["state"] == "BTC_IMPULSE_UP":
-        decision = "ALLOW_LONG" if best_probability >= allow_threshold else "WAIT"
-        reasons.extend(["btc_impulse_up", "alt_impulse_up"])
+        decision = "ALLOW_SHORT" if best_probability >= allow_threshold else "WAIT"
+        reasons.extend(["btc_impulse_up", "alt_impulse_up", "contrarian_short_after_pump"])
 
     elif alt.movement_state == "IMPULSE_DOWN" and btc_state["state"] == "BTC_IMPULSE_DOWN":
-        decision = "ALLOW_SHORT" if best_probability >= allow_threshold else "WAIT"
-        reasons.extend(["btc_impulse_down", "alt_impulse_down"])
+        decision = "ALLOW_LONG" if best_probability >= allow_threshold else "WAIT"
+        reasons.extend(["btc_impulse_down", "alt_impulse_down", "contrarian_long_after_dump"])
 
     # Condições de bloqueio
     elif alt.movement_state == "CHOP" or btc_state["state"] == "BTC_CHOP":

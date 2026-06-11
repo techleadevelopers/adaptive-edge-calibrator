@@ -291,9 +291,9 @@ def _estimate_target_probability(
     if alt.oi_change_pct > 0:
         base += 0.05
 
-    # BTC alignment
-    if (alt.direction == "LONG" and btc.direction == "LONG") or \
-       (alt.direction == "SHORT" and btc.direction == "SHORT"):
+    # BTC contrarian alignment for scalp reversal entries.
+    if (alt.direction == "LONG" and btc.direction == "SHORT") or \
+       (alt.direction == "SHORT" and btc.direction == "LONG"):
         base += 0.1
 
     # RSI zone
